@@ -220,6 +220,10 @@ final class KL252SimulatorCore: NSObject {
     private let expectedServiceCount = 3
     /// Central 对各特征的订阅计数（同一 Central 会订阅 AB02 + 2A19）
     private var centralSubscriptions: [UUID: Int] = [:]
+    /// 已建立 GATT 会话的 Central（订阅 / 读 / 写 任一即视为已连接）
+    private var connectedCentrals: Set<UUID> = []
+    /// 各 Central 已订阅 Notify 的特征
+    private var centralSubscribedCharacteristics: [UUID: Set<CBUUID>] = [:]
     private var resumeAdvertisingWorkItem: DispatchWorkItem?
 
     // MARK: Init
@@ -249,6 +253,8 @@ final class KL252SimulatorCore: NSObject {
             if hasConnectedCentrals {
                 log("⚠️ Central 可能已断开（未收到 unsubscribe），清除陈旧订阅", direction: .info)
                 centralSubscriptions.removeAll()
+                connectedCentrals.removeAll()
+                centralSubscribedCharacteristics.removeAll()
             }
             log("🔄 检测到广播已中断，正在恢复…", direction: .info)
             beginAdvertising()
@@ -266,6 +272,8 @@ final class KL252SimulatorCore: NSObject {
         resumeAdvertisingWorkItem?.cancel()
         resumeAdvertisingWorkItem = nil
         centralSubscriptions.removeAll()
+        connectedCentrals.removeAll()
+        centralSubscribedCharacteristics.removeAll()
 
         guard isAdvertising || peripheralManager.isAdvertising || responseChar != nil else { return }
         if peripheralManager.isAdvertising {
@@ -419,29 +427,83 @@ final class KL252SimulatorCore: NSObject {
         return "低于协议参考 ATT_MTU=\(KL252SimMTU.protocolAttMtu)（文件传输可能降速）"
     }
 
-    private func logCentralConnected(_ central: CBCentral, via characteristic: CBCharacteristic) {
+    private func characteristicDisplayName(_ uuid: CBUUID) -> String {
+        switch uuid {
+        case KL252_DEVICE_UUID.command:       return "AB01(命令写入)"
+        case KL252_DEVICE_UUID.response:      return "AB02(应答/事件 Notify)"
+        case KL252_DEVICE_UUID.fileTransfer:  return "AB03(文件传输)"
+        case KL252_DEVICE_UUID.deviceName:    return "2A00(设备名)"
+        case KL252_DEVICE_UUID.batteryLevel:  return "2A19(电量)"
+        default:                              return uuid.uuidString
+        }
+    }
+
+    private func centralShortID(_ central: CBCentral) -> String {
+        String(central.identifier.uuidString.prefix(8))
+    }
+
+    /// 首次 GATT 交互（读/写/订阅）时记录连接日志
+    private func noteCentralConnected(_ central: CBCentral, trigger: String) {
+        let id = central.identifier
+        guard !connectedCentrals.contains(id) else { return }
+        connectedCentrals.insert(id)
         updateMtuCache(from: central)
-        let id = central.identifier.uuidString.prefix(8)
+        let shortID = centralShortID(central)
         log(
-            "已连接 central=\(id) char=\(characteristic.uuid.uuidString) " +
+            "🔗 BLE 应用已连接 central=\(shortID) uuid=\(central.identifier.uuidString) " +
+            "触发=\(trigger) 设备=\(state.deviceName) 电量=\(state.batteryLevel)% " +
             "notifyMax=\(lastCentralNotifyMaxLength)B estATT_MTU=\(lastEstimatedAttMtu) " +
-            "estFilePayloadMax=\(lastEstimatedFilePayloadMax)B " +
+            "estWriteMax=\(lastEstimatedAttMtu - 3)B estFilePayloadMax=\(lastEstimatedFilePayloadMax)B " +
             "[\(mtuStatusNote(attMtu: lastEstimatedAttMtu))] " +
+            "已连接数=\(connectedCentrals.count)",
+            direction: .info
+        )
+        log(
+            "   GATT 服务: 1800(Generic Access) / AB00(KL252 自定义) / 180F(Battery)",
+            direction: .info
+        )
+        if !peripheralManager.isAdvertising {
+            log("   广播已由系统暂停（Central 连接中）", direction: .info)
+        }
+    }
+
+    private func logCentralConnected(_ central: CBCentral, via characteristic: CBCharacteristic) {
+        noteCentralConnected(central, trigger: "订阅 \(characteristicDisplayName(characteristic.uuid))")
+        let id = central.identifier
+        var subscribed = centralSubscribedCharacteristics[id] ?? []
+        subscribed.insert(characteristic.uuid)
+        centralSubscribedCharacteristics[id] = subscribed
+
+        let shortID = centralShortID(central)
+        log(
+            "central=\(shortID) 订阅 \(characteristicDisplayName(characteristic.uuid)) " +
+            "该Central订阅特征=\(subscribed.map { characteristicDisplayName($0) }.sorted().joined(separator: ", ")) " +
             "activeCentrals=\(centralSubscriptions.count)",
             direction: .info
         )
+
+        if characteristic.uuid == KL252_DEVICE_UUID.response {
+            log("✅ central=\(shortID) 协议应答通道 AB02 已就绪，可收发命令/事件", direction: .info)
+        }
+        if subscribed.contains(KL252_DEVICE_UUID.response),
+           subscribed.contains(KL252_DEVICE_UUID.batteryLevel) {
+            log("✅ central=\(shortID) 全部 Notify 订阅完成 (AB02 + 2A19)，连接就绪", direction: .info)
+        }
     }
 
     private func logCentralDisconnected(_ central: CBCentral, via characteristic: CBCharacteristic) {
-        let id = central.identifier.uuidString.prefix(8)
+        let shortID = centralShortID(central)
         let remaining = centralSubscriptions.count
         log(
-            "已断开 central=\(id) char=\(characteristic.uuid.uuidString) " +
+            "已断开 central=\(shortID) 取消订阅 \(characteristicDisplayName(characteristic.uuid)) " +
             "剩余Central=\(remaining) " +
             "最近 notifyMax=\(lastCentralNotifyMaxLength)B estATT_MTU=\(lastEstimatedAttMtu)",
             direction: .info
         )
         if remaining == 0 {
+            connectedCentrals.removeAll()
+            centralSubscribedCharacteristics.removeAll()
+            log("🔌 BLE 应用已全部断开", direction: .info)
             log(
                 wantsAdvertising ? "全部 Central 已断开，0.5s 后恢复广播" : "全部 Central 已断开，保持停播",
                 direction: .info
@@ -456,11 +518,21 @@ final class KL252SimulatorCore: NSObject {
         if count == 1 {
             logCentralConnected(central, via: characteristic)
         } else {
+            var subscribed = centralSubscribedCharacteristics[id] ?? []
+            subscribed.insert(characteristic.uuid)
+            centralSubscribedCharacteristics[id] = subscribed
             log(
-                "central=\(id.uuidString.prefix(8)) 追加订阅 char=\(characteristic.uuid.uuidString) " +
-                "该Central订阅数=\(count)",
+                "central=\(centralShortID(central)) 追加订阅 \(characteristicDisplayName(characteristic.uuid)) " +
+                "该Central订阅数=\(count) 特征=\(subscribed.map { characteristicDisplayName($0) }.sorted().joined(separator: ", "))",
                 direction: .info
             )
+            if characteristic.uuid == KL252_DEVICE_UUID.response {
+                log("✅ central=\(centralShortID(central)) 协议应答通道 AB02 已就绪，可收发命令/事件", direction: .info)
+            }
+            if subscribed.contains(KL252_DEVICE_UUID.response),
+               subscribed.contains(KL252_DEVICE_UUID.batteryLevel) {
+                log("✅ central=\(centralShortID(central)) 全部 Notify 订阅完成 (AB02 + 2A19)，连接就绪", direction: .info)
+            }
         }
         syncAdvertisingState(reason: "Central 订阅")
     }
@@ -470,13 +542,19 @@ final class KL252SimulatorCore: NSObject {
         guard let count = centralSubscriptions[id] else { return }
         if count <= 1 {
             centralSubscriptions.removeValue(forKey: id)
+            centralSubscribedCharacteristics.removeValue(forKey: id)
+            connectedCentrals.remove(id)
             logCentralDisconnected(central, via: characteristic)
             syncAdvertisingState(reason: "Central 取消订阅")
             scheduleResumeAdvertising()
         } else {
             centralSubscriptions[id] = count - 1
+            if var subscribed = centralSubscribedCharacteristics[id] {
+                subscribed.remove(characteristic.uuid)
+                centralSubscribedCharacteristics[id] = subscribed.isEmpty ? nil : subscribed
+            }
             log(
-                "central=\(id.uuidString.prefix(8)) 取消订阅 char=\(characteristic.uuid.uuidString) " +
+                "central=\(centralShortID(central)) 取消订阅 \(characteristicDisplayName(characteristic.uuid)) " +
                 "该Central剩余订阅=\(count - 1)",
                 direction: .info
             )
@@ -904,6 +982,8 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
             isAdvertising = false
             wantsAdvertising = false
             centralSubscriptions.removeAll()
+            connectedCentrals.removeAll()
+            centralSubscribedCharacteristics.removeAll()
             lastCentralNotifyMaxLength = 0
             lastEstimatedAttMtu = 0
             lastEstimatedFilePayloadMax = 0
@@ -951,17 +1031,17 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
             }
 
             let central = req.central
-                let mtu = mtuInfo(from: central)
-                let writeMax = mtu.attMtu - 3
-                if data.count > writeMax {
-                    log(
-                        "write 超长 len=\(data.count)B > estWriteMax=\(writeMax)B " +
-                        "char=\(req.characteristic.uuid.uuidString) estATT_MTU=\(mtu.attMtu)",
-                        direction: .received,
-                        level: .warn
-                    )
-                }
-            
+            noteCentralConnected(central, trigger: "写入 \(characteristicDisplayName(req.characteristic.uuid))")
+            let mtu = mtuInfo(from: central)
+            let writeMax = mtu.attMtu - 3
+            if data.count > writeMax {
+                log(
+                    "write 超长 len=\(data.count)B > estWriteMax=\(writeMax)B " +
+                    "char=\(req.characteristic.uuid.uuidString) estATT_MTU=\(mtu.attMtu)",
+                    direction: .received,
+                    level: .warn
+                )
+            }
 
             if req.characteristic.uuid == KL252_DEVICE_UUID.command {
                 handleCommandFrame(data)
@@ -978,6 +1058,7 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager,
                            didReceiveRead request: CBATTRequest) {
+        noteCentralConnected(request.central, trigger: "读取 \(characteristicDisplayName(request.characteristic.uuid))")
         if request.characteristic.uuid == KL252_DEVICE_UUID.batteryLevel {
             request.value = Data([state.batteryLevel])
             peripheral.respond(to: request, withResult: .success)
