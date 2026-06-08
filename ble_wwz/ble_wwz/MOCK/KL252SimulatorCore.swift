@@ -6,6 +6,9 @@
 import Foundation
 import CoreBluetooth
 import os
+#if os(macOS)
+import IOBluetooth
+#endif
 
 // MARK: - Local Logging (replaces iOS LogKit dependency)
 
@@ -55,6 +58,37 @@ enum KL252_DEVICE_UUID {
 enum KL252SimMTU {
     static let protocolAttMtu: Int = 247
     static let protocolFilePayloadMax: Int = 241
+}
+
+// MARK: - 广播 Manufacturer Data
+//
+// AD Type 0xFF Manufacturer Specific Data:
+//   [Company ID 2B LE][MAC 6B][NameLen 1B][Name UTF-8]
+// Company ID = 0xAB52（KL252 模拟器标识，Central 可按此过滤）
+enum KL252Advertisement {
+    static let companyID: UInt16 = 0xAB52
+    static let maxNameBytes = 20
+
+    static func manufacturerData(mac: [UInt8], deviceName: String) -> Data {
+        var mac6 = Array(mac.prefix(6))
+        if mac6.count < 6 {
+            mac6.append(contentsOf: Array(repeating: 0, count: 6 - mac6.count))
+        }
+        let nameBytes = Array(deviceName.utf8.prefix(maxNameBytes))
+        var payload: [UInt8] = mac6
+        payload.append(UInt8(nameBytes.count))
+        payload += nameBytes
+
+        var data = Data()
+        var cid = companyID.littleEndian
+        withUnsafeBytes(of: &cid) { data.append(contentsOf: $0) }
+        data.append(contentsOf: payload)
+        return data
+    }
+
+    static func macString(_ mac: [UInt8]) -> String {
+        mac.prefix(6).map { String(format: "%02X", $0) }.joined(separator: ":")
+    }
 }
 
 // 命令码
@@ -136,6 +170,8 @@ struct SimAlarm {
 class KL252SimulatorState {
     // 设备名
     var deviceName: String = "KL252-SIM"
+    /// 广播 Manufacturer Data 中的 MAC（6 字节）
+    var macAddress: [UInt8] = KL252SimulatorState.makeDefaultMacAddress()
     // 固件版本
     var firmwareMajor: UInt8 = 2
     var firmwareMinor: UInt8 = 1
@@ -176,6 +212,18 @@ class KL252SimulatorState {
     // 存储：128MB total, 64MB free
     var storageTotal: UInt32 = 134_217_728
     var storageFree: UInt32  = 67_108_864
+
+    var macAddressString: String { KL252Advertisement.macString(macAddress) }
+
+    static func makeDefaultMacAddress() -> [UInt8] {
+#if os(macOS)
+        if let addr = IOBluetoothHostController.default()?.addressAsString() {
+            let parts = addr.split(separator: ":").compactMap { UInt8($0, radix: 16) }
+            if parts.count == 6 { return parts }
+        }
+#endif
+        return [0x52, 0x4B, 0x25, 0x32, 0x00, 0x01]
+    }
 }
 
 // MARK: - Delegate Protocol
@@ -392,13 +440,42 @@ final class KL252SimulatorCore: NSObject {
             delegate?.simulatorDidUpdateState(self)
             return
         }
-        peripheralManager.startAdvertising([
-            CBAdvertisementDataLocalNameKey: state.deviceName,
-            CBAdvertisementDataServiceUUIDsKey: [KL252_DEVICE_UUID.customService, KL252_DEVICE_UUID.batteryService]
-        ])
+        let advData = buildAdvertisementData()
+        let mfgData = advData[CBAdvertisementDataManufacturerDataKey] as? Data ?? Data()
+        peripheralManager.startAdvertising(advData)
         isAdvertising = true
-        log("🟢 开始广播：\(state.deviceName)", direction: .info)
+        log(
+            "🟢 开始广播 name=\(state.deviceName) MAC=\(state.macAddressString) " +
+            "mfgData=\(hexString(mfgData))",
+            direction: .info
+        )
         delegate?.simulatorDidUpdateState(self)
+    }
+
+    /// 构建广播包：LocalName + ServiceUUIDs + ManufacturerData(MAC + 自定义名称)
+    private func buildAdvertisementData() -> [String: Any] {
+        let manufacturer = KL252Advertisement.manufacturerData(
+            mac: state.macAddress,
+            deviceName: state.deviceName
+        )
+        return [
+            CBAdvertisementDataLocalNameKey: state.deviceName,
+            CBAdvertisementDataServiceUUIDsKey: [
+                KL252_DEVICE_UUID.customService,
+                KL252_DEVICE_UUID.batteryService
+            ],
+            CBAdvertisementDataManufacturerDataKey: manufacturer
+        ]
+    }
+
+    /// 设备名变更后刷新广播，使 Manufacturer Data 与 LocalName 同步
+    private func refreshAdvertisingPayload() {
+        guard wantsAdvertising, responseChar != nil, !hasConnectedCentrals else { return }
+        guard peripheralManager.state == .poweredOn else { return }
+        if peripheralManager.isAdvertising {
+            peripheralManager.stopAdvertising()
+        }
+        beginAdvertising()
     }
 
     private var hasConnectedCentrals: Bool {
@@ -654,6 +731,7 @@ final class KL252SimulatorCore: NSObject {
         if let newName = String(bytes: nameBytes, encoding: .utf8) {
             state.deviceName = newName
             log("ℹ️ 设备名已更新为: \(newName)", direction: .info)
+            refreshAdvertisingPayload()
         }
         sendRenameReply(seq: seq, result: ResultCode.success.rawValue)
     }
@@ -1016,7 +1094,7 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
             isAdvertising = false
             delegate?.simulatorDidUpdateState(self)
         } else {
-            log("广播启动成功 name=\(state.deviceName)", direction: .info)
+            log("广播启动成功 name=\(state.deviceName) MAC=\(state.macAddressString)", direction: .info)
             isAdvertising = true
             delegate?.simulatorDidUpdateState(self)
         }
