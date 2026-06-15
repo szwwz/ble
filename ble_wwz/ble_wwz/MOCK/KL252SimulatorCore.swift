@@ -213,29 +213,17 @@ class KL252SimulatorState {
     // 电量
     var batteryLevel: UInt8 = 85
     // 时制 0=12h 1=24h
-    var hourFormat: UInt8 = 0
+    var hourFormat: UInt8 = KL252SimulatorDefaults.hourFormat
     // 息屏配置 [Enable, OffH, OffM, OnH, OnM]
-    var screenOffConfig: [UInt8] = [0x00, 0x00, 0x00, 0x00, 0x00]
+    var screenOffConfig: [UInt8] = KL252SimulatorDefaults.screenOffConfig
     // 来电提醒 [Enable, MusicID(4B), Volume]
-    var callRingConfig: [UInt8] = [0x00, 0x64, 0x00, 0x00, 0x00, 0x64]
+    var callRingConfig: [UInt8] = KL252SimulatorDefaults.callRingConfig
     // 免打扰
     var dndEnabled: UInt8 = 0x00
     // Alarms 全局开关
-    var alarmsGlobalEnabled: UInt8 = 0x01
+    var alarmsGlobalEnabled: UInt8 = KL252SimulatorDefaults.alarmsGlobalEnabled
     // 例程基础设置（38字节）
-    var programBasicConfig: [UInt8] = {
-        // 目标时长 480min (E0 01)
-        // 睡眠提醒：开，MusicID=100，Vol=80，Duration=45min(2D 00)
-        // 四期：提示/激活/唤醒开启，锁定期关闭；各7B
-        var cfg: [UInt8] = []
-        cfg += [0xE0, 0x01]                           // TargetDuration=480
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x2D, 0x00]  // 睡眠提醒
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]         // 提示期
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]         // 激活期
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]         // 唤醒期
-        cfg += [0x00, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]         // 锁定期
-        return cfg
-    }()
+    var programBasicConfig: [UInt8] = KL252SimulatorDefaults.programBasicConfig
     // 闹钟列表
     var alarms: [UInt8: SimAlarm] = [:]
     // 运行状态：[RunState, AlarmType, AlarmID, Phase]
@@ -252,6 +240,27 @@ class KL252SimulatorState {
     var currentMusicID: UInt32 = 0
 
     var macAddressString: String { KL252Advertisement.macString(macAddress) }
+
+    /// 从持久化快照恢复设备设置字段（不影响运行时/非持久字段）
+    func apply(_ snapshot: KL252SimulatorSnapshot) {
+        hourFormat = snapshot.hourFormat
+        screenOffConfig = snapshot.screenOffConfig
+        callRingConfig = snapshot.callRingConfig
+        alarmsGlobalEnabled = snapshot.alarmsGlobalEnabled
+        programBasicConfig = snapshot.programBasicConfig
+        alarms = Dictionary(uniqueKeysWithValues: snapshot.alarms.map { ($0.alarmID, $0.toSimAlarm()) })
+    }
+
+    func makeSnapshot() -> KL252SimulatorSnapshot {
+        KL252SimulatorSnapshot(
+            hourFormat: hourFormat,
+            screenOffConfig: screenOffConfig,
+            callRingConfig: callRingConfig,
+            alarmsGlobalEnabled: alarmsGlobalEnabled,
+            programBasicConfig: programBasicConfig,
+            alarms: alarms.values.map { PersistedAlarm(from: $0) }.sorted { $0.alarmID < $1.alarmID }
+        )
+    }
 
     static func makeDefaultMacAddress() -> [UInt8] {
 #if os(macOS)
@@ -330,6 +339,14 @@ final class KL252SimulatorCore: NSObject {
     override init() {
         super.init()
         peripheralManager = CBPeripheralManager(delegate: self, queue: .main)
+        if let snapshot = KL252SimulatorPersistence.load() {
+            state.apply(snapshot)
+        }
+    }
+
+    /// 将设备设置字段写入 Application Support JSON
+    private func persistDeviceSettings() {
+        KL252SimulatorPersistence.save(state.makeSnapshot())
     }
 
     // MARK: Public Control
@@ -829,6 +846,7 @@ final class KL252SimulatorCore: NSObject {
             alarm.wakeupPeriod  = Array(payload[(headerEnd+11)..<(headerEnd+18)])
         }
         state.alarms[alarmID] = alarm
+        persistDeviceSettings()
         sendReply(seq: seq, cmdID: CmdID.addOrModifyAlarm.rawValue, result: ResultCode.success.rawValue)
     }
 
@@ -839,6 +857,7 @@ final class KL252SimulatorCore: NSObject {
         }
         if state.alarms[alarmID] != nil {
             state.alarms.removeValue(forKey: alarmID)
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.deleteAlarm.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.deleteAlarm.rawValue, result: ResultCode.notFound.rawValue)
@@ -876,6 +895,7 @@ final class KL252SimulatorCore: NSObject {
         } else if dataLen == 38 && payload.count == 38 {
             // 设置
             state.programBasicConfig = payload
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.programBasicConfig.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.programBasicConfig.rawValue, result: ResultCode.invalidParam.rawValue)
@@ -888,6 +908,7 @@ final class KL252SimulatorCore: NSObject {
                       result: ResultCode.success.rawValue, extra: [state.alarmsGlobalEnabled])
         } else if dataLen == 1, let v = payload.first {
             state.alarmsGlobalEnabled = v
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.alarmsGlobalSwitch.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.alarmsGlobalSwitch.rawValue, result: ResultCode.invalidParam.rawValue)
@@ -921,6 +942,7 @@ final class KL252SimulatorCore: NSObject {
                       result: ResultCode.success.rawValue, extra: [state.hourFormat])
         } else if dataLen == 1, let v = payload.first {
             state.hourFormat = v
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.hourFormat.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.hourFormat.rawValue, result: ResultCode.invalidParam.rawValue)
@@ -933,6 +955,7 @@ final class KL252SimulatorCore: NSObject {
                       result: ResultCode.success.rawValue, extra: state.screenOffConfig)
         } else if dataLen == 5 && payload.count == 5 {
             state.screenOffConfig = payload
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.screenOff.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.screenOff.rawValue, result: ResultCode.invalidParam.rawValue)
@@ -945,6 +968,7 @@ final class KL252SimulatorCore: NSObject {
                       result: ResultCode.success.rawValue, extra: state.callRingConfig)
         } else if dataLen == 6 && payload.count == 6 {
             state.callRingConfig = payload
+            persistDeviceSettings()
             sendReply(seq: seq, cmdID: CmdID.callRingConfig.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.callRingConfig.rawValue, result: ResultCode.invalidParam.rawValue)
@@ -980,14 +1004,10 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.factoryReset.rawValue, result: ResultCode.invalidParam.rawValue)
             return
         }
-        // 重置状态
-        state.alarms.removeAll()
-        state.hourFormat = 0
-        state.screenOffConfig = [0,0,0,0,0]
-        state.callRingConfig  = [0x00, 0x64, 0x00, 0x00, 0x00, 0x64]
+        // 重置持久化字段并写回出厂默认快照
+        state.apply(KL252SimulatorDefaults.makeSnapshot())
+        persistDeviceSettings()
         state.dndEnabled      = 0
-        state.alarmsGlobalEnabled = 1
-        state.programBasicConfig  = defaultProgramBasicConfig()
         state.runState = [0,0,0,0]
         state.musicVolume = 80
         state.playState = 0x00
@@ -1279,17 +1299,6 @@ final class KL252SimulatorCore: NSObject {
         }
         WZLog("\(tag) \(msg)", level: level)
         delegate?.simulator(self, didLog: msg, direction: direction)
-    }
-
-    private func defaultProgramBasicConfig() -> [UInt8] {
-        var cfg: [UInt8] = []
-        cfg += [0xE0, 0x01]
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x2D, 0x00]
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
-        cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
-        cfg += [0x00, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
-        return cfg
     }
 
     private func readUInt32LE(_ bytes: [UInt8], offset: Int) -> UInt32 {
