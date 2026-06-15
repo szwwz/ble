@@ -12,7 +12,33 @@ enum KL252SimulatorDefaults {
     /// 关闭 + MusicID=3 + Vol=100（§4.2 `0x23` 协议默认）
     static let callRingConfig: [UInt8] = [0x00, 0x03, 0x00, 0x00, 0x00, 0x64]
     static let alarmsGlobalEnabled: UInt8 = 0x01
-    static let alarms: [PersistedAlarm] = []
+
+    /// §4.1 出厂默认闹钟（与协议 0x03 示例一致：例程 ID=1 + 其他闹钟 ID=2）
+    static let alarms: [PersistedAlarm] = [
+        PersistedAlarm(from: SimAlarm(
+            alarmType: 0x00, alarmID: 1, nameLen: 0, name: [],
+            sleepSchedule: [0x01, 0x16, 0x00, 0x7F], wakeSchedule: [0x01, 0x07, 0x00, 0x7F],
+            mainSchedule: [], activePeriod: [], wakeupPeriod: []
+        )),
+        PersistedAlarm(from: SimAlarm(
+            alarmType: 0x01, alarmID: 2, nameLen: 0, name: [],
+            sleepSchedule: [], wakeSchedule: [],
+            mainSchedule: [0x01, 0x07, 0x1E, 0x3E],
+            activePeriod: [0x01, 0xC8, 0x00, 0x00, 0x00, 0x3C, 0x0A],
+            wakeupPeriod: [0x01, 0xC8, 0x00, 0x00, 0x00, 0x3C, 0x0A]
+        )),
+        PersistedAlarm(from: SimAlarm(
+            alarmType: 0x01, alarmID: 3, nameLen: 6, name: Array("午休".utf8),
+            sleepSchedule: [], wakeSchedule: [],
+            mainSchedule: [0x01, 0x0C, 0x1E, 0x7F],
+            activePeriod: [0x01, 0x64, 0x00, 0x00, 0x00, 0x14, 0x05],
+            wakeupPeriod: [0x01, 0x64, 0x00, 0x00, 0x00, 0x14, 0x05]
+        )),
+    ]
+
+    static var simAlarms: [UInt8: SimAlarm] {
+        Dictionary(uniqueKeysWithValues: alarms.map { ($0.alarmID, $0.toSimAlarm()) })
+    }
 
     /// §4.1.1 出厂 38B 例程基础设置
     static var programBasicConfig: [UInt8] {

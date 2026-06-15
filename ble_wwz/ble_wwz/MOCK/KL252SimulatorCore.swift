@@ -224,12 +224,12 @@ class KL252SimulatorState {
     var alarmsGlobalEnabled: UInt8 = KL252SimulatorDefaults.alarmsGlobalEnabled
     // 例程基础设置（38字节）
     var programBasicConfig: [UInt8] = KL252SimulatorDefaults.programBasicConfig
-    // 闹钟列表
-    var alarms: [UInt8: SimAlarm] = [:]
+    // 闹钟列表（出厂默认 3 条，见 KL252SimulatorDefaults.alarms）
+    var alarms: [UInt8: SimAlarm] = KL252SimulatorDefaults.simAlarms
     // 运行状态：[RunState, AlarmType, AlarmID, Phase]
     var runState: [UInt8] = [0x00, 0x00, 0x00, 0x00]
     // 音源列表 MusicID
-    var musicList: [UInt32] = [100, 200]
+    var musicList: [UInt32] = KL252SimulatorMusicCatalog.bundledMusicIDs()
     // 存储：128MB total, 64MB free
     var storageTotal: UInt32 = 134_217_728
     var storageFree: UInt32  = 67_108_864
@@ -334,6 +334,8 @@ final class KL252SimulatorCore: NSObject {
     private var resumeAdvertisingWorkItem: DispatchWorkItem?
     /// 进行中的音源文件传输会话（§5.0）
     private var fileTransferSession: FileTransferSession?
+    /// §4.4 真实音源播放器
+    private let musicPlayer = KL252SimulatorMusicPlayer()
 
     // MARK: Init
     override init() {
@@ -342,6 +344,8 @@ final class KL252SimulatorCore: NSObject {
         if let snapshot = KL252SimulatorPersistence.load() {
             state.apply(snapshot)
         }
+        reloadBundledMusicList()
+        musicPlayer.delegate = self
     }
 
     /// 将设备设置字段写入 Application Support JSON
@@ -428,6 +432,11 @@ final class KL252SimulatorCore: NSObject {
 
     /// 来电提醒状态变更
     func sendCallRingEvent(action: UInt8) {
+        if action == 0x01 {
+            beginCallRingPlayback()
+        } else if action == 0x00 {
+            stopCallRingPlayback()
+        }
         sendEventFrame(eventID: EventID.callRingChange.rawValue, payload: [action])
     }
 
@@ -981,6 +990,11 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         sendReply(seq: seq, cmdID: CmdID.callRingAction.rawValue, result: ResultCode.success.rawValue)
+        if action == 0x01 {
+            beginCallRingPlayback()
+        } else if action == 0x00 {
+            stopCallRingPlayback()
+        }
         // 立即触发事件 0xE7
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.sendCallRingEvent(action: action)
@@ -1009,10 +1023,12 @@ final class KL252SimulatorCore: NSObject {
         persistDeviceSettings()
         state.dndEnabled      = 0
         state.runState = [0,0,0,0]
+        musicPlayer.stop()
         state.musicVolume = 80
         state.playState = 0x00
         state.playSource = 0x00
         state.currentMusicID = 0
+        reloadBundledMusicList()
         fileTransferSession = nil
         sendReply(seq: seq, cmdID: CmdID.factoryReset.rawValue, result: ResultCode.success.rawValue)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -1072,15 +1088,17 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.notFound.rawValue)
             return
         }
-        state.playSource = 0x00
-        state.playState = 0x01
-        state.currentMusicID = mid
-        sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.success.rawValue)
+        if beginAppMusicPlayback(musicID: mid) {
+            sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.success.rawValue)
+        } else {
+            sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.notFound.rawValue)
+        }
     }
 
     /// §4.4 命令 0x44 — 暂停 APP 点播播放
     private func handlePauseMusic(seq: UInt8) {
         if state.playSource == 0x00, state.playState == 0x01 {
+            musicPlayer.pause()
             state.playState = 0x02
         }
         sendReply(seq: seq, cmdID: CmdID.pauseMusic.rawValue, result: ResultCode.success.rawValue)
@@ -1093,6 +1111,7 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         state.musicVolume = volume
+        musicPlayer.setVolume(volume)
         sendReply(seq: seq, cmdID: CmdID.setMusicVolume.rawValue, result: ResultCode.success.rawValue)
     }
 
@@ -1310,6 +1329,62 @@ final class KL252SimulatorCore: NSObject {
         UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
     }
 
+
+    /// 合并 Bundle 预置音源与已传输音源 ID
+    private func reloadBundledMusicList() {
+        var ids = Set(KL252SimulatorMusicCatalog.bundledMusicIDs())
+        ids.formUnion(state.musicList)
+        state.musicList = ids.sorted()
+    }
+
+    /// §4.4 APP 点播（0x43）：播放或恢复暂停曲目
+    @discardableResult
+    private func beginAppMusicPlayback(musicID: UInt32) -> Bool {
+        if state.playSource == 0x00,
+           state.playState == 0x02,
+           state.currentMusicID == musicID,
+           musicPlayer.resume(volume: state.musicVolume) {
+            state.playState = 0x01
+            if let name = KL252SimulatorMusicCatalog.displayName(for: musicID) {
+                log("▶️ 恢复播放 MusicID=\(musicID) (\(name))", direction: .info)
+            }
+            return true
+        }
+        guard musicPlayer.play(musicID: musicID, volume: state.musicVolume) else { return false }
+        state.playSource = 0x00
+        state.playState = 0x01
+        state.currentMusicID = musicID
+        if let name = KL252SimulatorMusicCatalog.displayName(for: musicID) {
+            log("▶️ 开始播放 MusicID=\(musicID) (\(name)) Vol=\(state.musicVolume)", direction: .info)
+        }
+        return true
+    }
+
+    /// §4.2 来电提醒播放（PlaySource=0x02）
+    private func beginCallRingPlayback() {
+        guard state.callRingConfig.first == 0x01 else { return }
+        let musicID = readUInt32LE(state.callRingConfig, offset: 1)
+        let volume = state.callRingConfig[5]
+        guard state.musicList.contains(musicID),
+              musicPlayer.play(musicID: musicID, volume: volume) else { return }
+        state.playSource = 0x02
+        state.playState = 0x01
+        state.currentMusicID = musicID
+        state.musicVolume = volume
+        if let name = KL252SimulatorMusicCatalog.displayName(for: musicID) {
+            log("📞 来电提醒播放 MusicID=\(musicID) (\(name))", direction: .info)
+        }
+    }
+
+    private func stopCallRingPlayback() {
+        guard state.playSource == 0x02 else { return }
+        musicPlayer.stop()
+        state.playState = 0x00
+        state.playSource = 0x00
+        state.currentMusicID = 0
+        log("📞 来电提醒停止", direction: .info)
+    }
+
     /// §4.4 删除音源时，正在播放/暂停该 MusicID 则返回 busy
     private func isMusicPlaybackBusy(for musicID: UInt32) -> Bool {
         guard state.playSource == 0x00 else { return false }
@@ -1346,6 +1421,21 @@ final class KL252SimulatorCore: NSObject {
         } else {
             state.runState = [0x00, 0x00, 0x00, 0x00]
         }
+    }
+}
+
+
+// MARK: - Music Player Delegate
+
+extension KL252SimulatorCore: KL252SimulatorMusicPlayerDelegate {
+    func musicPlayerDidFinishPlaying(_ player: KL252SimulatorMusicPlayer) {
+        if state.playState != 0x00 {
+            log("⏹ 播放结束 MusicID=\(state.currentMusicID)", direction: .info)
+        }
+        state.playState = 0x00
+        state.playSource = 0x00
+        state.currentMusicID = 0
+        delegate?.simulatorDidUpdateState(self)
     }
 }
 
