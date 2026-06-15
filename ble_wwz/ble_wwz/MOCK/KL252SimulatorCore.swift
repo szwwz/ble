@@ -1,6 +1,6 @@
 // KL252SimulatorCore.swift
 // BLE 虚拟设备模拟器 - 核心外设管理器
-// 模拟 KL252 从机设备，响应协议 v1.0.1 中除文件传输、固件升级以外的全部指令
+// 模拟 KL252 从机设备，响应协议 v1.0.1；含文件传输；不含固件升级 (§4.6)
 // ⚠️ 本文件为独立模拟器模块，不影响项目原有 BLE 业务代码
 
 import Foundation
@@ -54,10 +54,10 @@ enum KL252_DEVICE_UUID {
 // 在连接后协商。Peripheral 可通过 `CBCentral.maximumUpdateValueLength` 读取 Central
 // 单次 Notify/Indication 可接收的最大字节数，并反推 ATT_MTU ≈ notifyMax + 3。
 //
-// KL252 协议参考：ATT_MTU = 247 → AB03 文件块 payloadMax = 241（= MTU - 6）。
+// KL252 协议参考：ATT_MTU = 247 → AB03 文件块 payloadMax = 238（= MTU - 9，§3.5）。
 enum KL252SimMTU {
     static let protocolAttMtu: Int = 247
-    static let protocolFilePayloadMax: Int = 241
+    static let protocolFilePayloadMax: Int = 238
 }
 
 // MARK: - 广播 Manufacturer Data
@@ -91,6 +91,36 @@ enum KL252Advertisement {
     }
 }
 
+// MARK: - Frame Codec (§3.0)
+
+/// 全局帧头 `0xA5 0x5A` + 末字节 XOR 校验；2A19 电量与 CCCD 写入除外。
+enum KL252FrameCodec {
+    static let header: [UInt8] = [0xA5, 0x5A]
+
+    /// 从帧头到负载末字节的逐字节 XOR（不含校验位）。
+    static func xorChecksum(_ bytes: [UInt8]) -> UInt8 {
+        bytes.reduce(0, ^)
+    }
+
+    /// 校验完整帧并返回负载（已剥离帧头与校验字节）；失败返回 nil。
+    static func validateAndStrip(_ data: Data) -> [UInt8]? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= header.count + 1,
+              bytes[0] == header[0],
+              bytes[1] == header[1] else { return nil }
+        let body = Array(bytes.dropLast())
+        guard xorChecksum(body) == bytes.last else { return nil }
+        return Array(bytes.dropFirst(header.count).dropLast())
+    }
+
+    /// 为负载追加帧头与 XOR 校验，生成完整帧。
+    static func wrap(_ payload: [UInt8]) -> Data {
+        let body = header + payload
+        let checksum = xorChecksum(body)
+        return Data(body + [checksum])
+    }
+}
+
 // 命令码
 enum CmdID: UInt8 {
     // 闹钟与例程 0x01~0x07
@@ -108,15 +138,19 @@ enum CmdID: UInt8 {
     case callRingConfig     = 0x23
     case callRingAction     = 0x24
     case queryDND           = 0x25
-    // 设备与固件 0x30~0x32
+    // 设备与固件 0x30~0x3F（§4.3）
     case queryFirmware      = 0x30
-    case otaRequest         = 0x31  // 固件升级：直接拒绝(0x04)
-    case factoryReset       = 0x32
+    case factoryReset       = 0x31   // §4.3 恢复出厂，ConfirmCode=0xA5
     // 音源与存储 0x40~0x42
     case queryStorage       = 0x40
     case queryMusicList     = 0x41
     case deleteMusic        = 0x42
-    // 文件传输 0x50~0x54（全部返回不支持/忙）
+    // 音乐播放 §4.4
+    case playMusic          = 0x43
+    case pauseMusic         = 0x44
+    case setMusicVolume     = 0x45
+    case queryMusicPlayState = 0x46
+    // 文件传输 §4.5
     case fileStart          = 0x50
     case fileEnd            = 0x51
     case fileWindowReq      = 0x52
@@ -126,7 +160,7 @@ enum CmdID: UInt8 {
     case rename             = 0x55
 }
 
-// Result 码
+// Result 码（§6.1）
 enum ResultCode: UInt8 {
     case success        = 0x00
     case invalidParam   = 0x01
@@ -136,7 +170,7 @@ enum ResultCode: UInt8 {
     case notFound       = 0x05
 }
 
-// 事件码
+// 事件码（§6.2）
 enum EventID: UInt8 {
     case alarmTrigger   = 0xE1
     case alarmTimeout   = 0xE2
@@ -145,7 +179,6 @@ enum EventID: UInt8 {
     case fileCancel     = 0xE6
     case callRingChange = 0xE7
     case factoryRestart = 0xE8
-    case otaResult      = 0xEA
     case dndChange      = 0xEB
 }
 
@@ -212,6 +245,11 @@ class KL252SimulatorState {
     // 存储：128MB total, 64MB free
     var storageTotal: UInt32 = 134_217_728
     var storageFree: UInt32  = 67_108_864
+    // 音乐播放 §4.4
+    var musicVolume: UInt8 = 80          // 0x45 持久化音量
+    var playState: UInt8 = 0x00          // 0x00 空闲 / 0x01 播放 / 0x02 暂停
+    var playSource: UInt8 = 0x00         // 0x00 APP / 0x01 例程闹钟 / 0x02 来电
+    var currentMusicID: UInt32 = 0
 
     var macAddressString: String { KL252Advertisement.macString(macAddress) }
 
@@ -237,6 +275,18 @@ enum LogDirection {
     case received   // APP → 设备
     case sent       // 设备 → APP
     case info       // 系统信息
+}
+
+// MARK: - File Transfer Session (§4.5 + §5)
+
+private struct FileTransferSession {
+    var fileID: UInt8
+    var musicID: UInt32
+    var fileSize: UInt32
+    var packetCount: Int
+    var payloadMax: Int
+    var received: [UInt16: Data] = [:]
+    var fileXor: UInt8 = 0
 }
 
 // MARK: - Core Simulator
@@ -273,6 +323,8 @@ final class KL252SimulatorCore: NSObject {
     /// 各 Central 已订阅 Notify 的特征
     private var centralSubscribedCharacteristics: [UUID: Set<CBUUID>] = [:]
     private var resumeAdvertisingWorkItem: DispatchWorkItem?
+    /// 进行中的音源文件传输会话（§5.0）
+    private var fileTransferSession: FileTransferSession?
 
     // MARK: Init
     override init() {
@@ -486,7 +538,7 @@ final class KL252SimulatorCore: NSObject {
     private func mtuInfo(from central: CBCentral) -> (notifyMax: Int, attMtu: Int, filePayloadMax: Int) {
         let notifyMax = central.maximumUpdateValueLength
         let attMtu = notifyMax + 3
-        let filePayloadMax = max(1, attMtu - 3 - 3)
+        let filePayloadMax = max(1, attMtu - 9)
         return (notifyMax, attMtu, filePayloadMax)
     }
 
@@ -580,6 +632,7 @@ final class KL252SimulatorCore: NSObject {
         if remaining == 0 {
             connectedCentrals.removeAll()
             centralSubscribedCharacteristics.removeAll()
+            fileTransferSession = nil
             log("🔌 BLE 应用已全部断开", direction: .info)
             log(
                 wantsAdvertising ? "全部 Central 已断开，0.5s 后恢复广播" : "全部 Central 已断开，保持停播",
@@ -663,17 +716,17 @@ final class KL252SimulatorCore: NSObject {
 
     // MARK: - Private: Frame Handling
 
-    /// 处理写入 0xAB01 的命令帧
+    /// 处理写入 0xAB01 的命令帧（§3.2，经 §3.0 帧解码）
     private func handleCommandFrame(_ data: Data) {
-        guard data.count >= 3 else {
-            log("⚠️ 命令帧过短: \(hexString(data))", direction: .info)
+        guard let bytes = KL252FrameCodec.validateAndStrip(data), bytes.count >= 3 else {
+            log("⚠️ 命令帧校验失败或过短: \(hexString(data))", direction: .received, level: .warn)
             return
         }
-        let bytes = [UInt8](data)
         let cmdID = bytes[0]
         let seq   = bytes[1]
         let dataLen = bytes[2]
-        let payload = dataLen > 0 && bytes.count > 3 ? Array(bytes[3...]) : []
+        let payloadEnd = min(bytes.count, 3 + Int(dataLen))
+        let payload = dataLen > 0 ? Array(bytes[3..<payloadEnd]) : []
 
         log("AB01 cmd=0x\(String(format: "%02X", cmdID)) seq=\(seq) payloadLen=\(dataLen) frame=\(hexString(data))", direction: .received)
 
@@ -695,28 +748,31 @@ final class KL252SimulatorCore: NSObject {
         case CmdID.queryDND.rawValue:            handleQueryDND(seq: seq)
         // ── 设备与固件 ──
         case CmdID.queryFirmware.rawValue:       handleQueryFirmware(seq: seq)
-        case CmdID.otaRequest.rawValue:          sendReply(seq: seq, cmdID: cmdID, result: ResultCode.unsupported.rawValue)
         case CmdID.factoryReset.rawValue:        handleFactoryReset(seq: seq, payload: payload)
         // ── 音源与存储 ──
         case CmdID.queryStorage.rawValue:        handleQueryStorage(seq: seq)
         case CmdID.queryMusicList.rawValue:      handleQueryMusicList(seq: seq)
         case CmdID.deleteMusic.rawValue:         handleDeleteMusic(seq: seq, payload: payload)
-        // ── 文件传输（排除，返回不支持）──
-        case CmdID.fileStart.rawValue,
-             CmdID.fileEnd.rawValue,
-             CmdID.fileWindowReq.rawValue,
-             CmdID.fileCancel.rawValue:
-            sendReply(seq: seq, cmdID: cmdID, result: ResultCode.unsupported.rawValue)
+        // ── 音乐播放 §4.4 ──
+        case CmdID.playMusic.rawValue:           handlePlayMusic(seq: seq, payload: payload)
+        case CmdID.pauseMusic.rawValue:          handlePauseMusic(seq: seq)
+        case CmdID.setMusicVolume.rawValue:      handleSetMusicVolume(seq: seq, payload: payload)
+        case CmdID.queryMusicPlayState.rawValue: handleQueryMusicPlayState(seq: seq)
+        // ── 文件传输 §4.5 ──
+        case CmdID.fileStart.rawValue:           handleFileStart(seq: seq, payload: payload)
+        case CmdID.fileEnd.rawValue:             handleFileEnd(seq: seq, payload: payload)
+        case CmdID.fileWindowReq.rawValue:       handleFileWindowReq(seq: seq, payload: payload)
+        case CmdID.fileCancel.rawValue:          handleFileCancel(seq: seq, payload: payload)
         default:
             sendReply(seq: seq, cmdID: cmdID, result: ResultCode.unsupported.rawValue)
         }
     }
 
-    /// 处理写入 0x2A00 的名称修改帧
+    /// 处理写入 0x2A00 的名称修改帧（§3.1，经 §3.0 帧解码）
     private func handleRenameFrame(_ data: Data) {
-        let bytes = [UInt8](data)
-        guard bytes.count >= 3, bytes[0] == 0x55 else {
-            log("2A00 rename 格式错误 frame=\(hexString(data))", direction: .received, level: .warn)
+        guard let bytes = KL252FrameCodec.validateAndStrip(data),
+              bytes.count >= 3, bytes[0] == CmdID.rename.rawValue else {
+            log("2A00 rename 校验失败或格式错误 frame=\(hexString(data))", direction: .received, level: .warn)
             return
         }
         let seq     = bytes[1]
@@ -933,6 +989,11 @@ final class KL252SimulatorCore: NSObject {
         state.alarmsGlobalEnabled = 1
         state.programBasicConfig  = defaultProgramBasicConfig()
         state.runState = [0,0,0,0]
+        state.musicVolume = 80
+        state.playState = 0x00
+        state.playSource = 0x00
+        state.currentMusicID = 0
+        fileTransferSession = nil
         sendReply(seq: seq, cmdID: CmdID.factoryReset.rawValue, result: ResultCode.success.rawValue)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.sendFactoryRestartEvent()
@@ -963,7 +1024,11 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.deleteMusic.rawValue, result: ResultCode.invalidParam.rawValue)
             return
         }
-        let mid = UInt32(payload[0]) | (UInt32(payload[1]) << 8) | (UInt32(payload[2]) << 16) | (UInt32(payload[3]) << 24)
+        let mid = readUInt32LE(payload, offset: 0)
+        if isMusicPlaybackBusy(for: mid) {
+            sendReply(seq: seq, cmdID: CmdID.deleteMusic.rawValue, result: ResultCode.busy.rawValue)
+            return
+        }
         if let idx = state.musicList.firstIndex(of: mid) {
             state.musicList.remove(at: idx)
             sendReply(seq: seq, cmdID: CmdID.deleteMusic.rawValue, result: ResultCode.success.rawValue)
@@ -972,28 +1037,219 @@ final class KL252SimulatorCore: NSObject {
         }
     }
 
+    /// §4.4 命令 0x43 — 指定 ID 播放音乐
+    private func handlePlayMusic(seq: UInt8, payload: [UInt8]) {
+        guard payload.count >= 4 else {
+            sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        let mid = readUInt32LE(payload, offset: 0)
+        guard mid >= 100, mid <= 999_999 else {
+            sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        guard state.musicList.contains(mid) else {
+            sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.notFound.rawValue)
+            return
+        }
+        state.playSource = 0x00
+        state.playState = 0x01
+        state.currentMusicID = mid
+        sendReply(seq: seq, cmdID: CmdID.playMusic.rawValue, result: ResultCode.success.rawValue)
+    }
+
+    /// §4.4 命令 0x44 — 暂停 APP 点播播放
+    private func handlePauseMusic(seq: UInt8) {
+        if state.playSource == 0x00, state.playState == 0x01 {
+            state.playState = 0x02
+        }
+        sendReply(seq: seq, cmdID: CmdID.pauseMusic.rawValue, result: ResultCode.success.rawValue)
+    }
+
+    /// §4.4 命令 0x45 — 音量设置
+    private func handleSetMusicVolume(seq: UInt8, payload: [UInt8]) {
+        guard let volume = payload.first, volume >= 1, volume <= 100 else {
+            sendReply(seq: seq, cmdID: CmdID.setMusicVolume.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        state.musicVolume = volume
+        sendReply(seq: seq, cmdID: CmdID.setMusicVolume.rawValue, result: ResultCode.success.rawValue)
+    }
+
+    /// §4.4 命令 0x46 — 查询音乐播放状态
+    private func handleQueryMusicPlayState(seq: UInt8) {
+        var extra: [UInt8]
+        if state.playState == 0x00 {
+            extra = [state.playState, state.musicVolume]
+        } else {
+            extra = [state.playState, state.playSource]
+            extra += withUnsafeBytes(of: state.currentMusicID.littleEndian) { Array($0) }
+            extra.append(state.musicVolume)
+        }
+        sendReply(seq: seq, cmdID: CmdID.queryMusicPlayState.rawValue,
+                  result: ResultCode.success.rawValue, extra: extra)
+    }
+
+    /// §4.5 命令 0x50 — 文件传输开始
+    private func handleFileStart(seq: UInt8, payload: [UInt8]) {
+        guard payload.count >= 9 else {
+            sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        if fileTransferSession != nil {
+            sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.busy.rawValue)
+            return
+        }
+        let fileID = payload[0]
+        let musicID = readUInt32LE(payload, offset: 1)
+        let fileSize = readUInt32LE(payload, offset: 5)
+        guard musicID >= 100, musicID <= 999_999, fileSize > 0 else {
+            sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        guard fileSize <= state.storageFree else {
+            sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.fileError.rawValue)
+            return
+        }
+        let payloadMax = currentFilePayloadMax()
+        let packetCount = Int((fileSize + UInt32(payloadMax) - 1) / UInt32(payloadMax))
+        fileTransferSession = FileTransferSession(
+            fileID: fileID,
+            musicID: musicID,
+            fileSize: fileSize,
+            packetCount: packetCount,
+            payloadMax: payloadMax
+        )
+        sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.success.rawValue)
+    }
+
+    /// §4.5 命令 0x51 — 文件传输结束
+    private func handleFileEnd(seq: UInt8, payload: [UInt8]) {
+        guard payload.count >= 2 else {
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        let fileID = payload[0]
+        let expectedXor = payload[1]
+        guard let session = fileTransferSession, session.fileID == fileID else {
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.notFound.rawValue)
+            return
+        }
+        guard session.received.count == session.packetCount, session.fileXor == expectedXor else {
+            fileTransferSession = nil
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.fileError.rawValue)
+            return
+        }
+        if !state.musicList.contains(session.musicID) {
+            state.musicList.append(session.musicID)
+            state.musicList.sort()
+        }
+        state.storageFree -= session.fileSize
+        let completedFileID = session.fileID
+        let completedMusicID = session.musicID
+        fileTransferSession = nil
+        sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.success.rawValue)
+        sendEventFrame(eventID: EventID.fileComplete.rawValue,
+                       payload: [completedFileID] + withUnsafeBytes(of: completedMusicID.littleEndian) { Array($0) } + [0x00])
+    }
+
+    /// §4.5 命令 0x52 — 请求窗口状态（应答 CmdID 0x53）
+    private func handleFileWindowReq(seq: UInt8, payload: [UInt8]) {
+        guard payload.count >= 3 else {
+            sendReply(seq: seq, cmdID: CmdID.fileWindowRsp.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        let fileID = payload[0]
+        let windowBase = readUInt16LE(payload, offset: 1)
+        guard let session = fileTransferSession, session.fileID == fileID else {
+            sendReply(seq: seq, cmdID: CmdID.fileWindowRsp.rawValue, result: ResultCode.notFound.rawValue)
+            return
+        }
+        let bitmap = buildWindowBitmap(session: session, windowBase: windowBase)
+        var extra: [UInt8] = [fileID]
+        extra += withUnsafeBytes(of: windowBase.littleEndian) { Array($0) }
+        extra += bitmap
+        sendReply(seq: seq, cmdID: CmdID.fileWindowRsp.rawValue, result: ResultCode.success.rawValue, extra: extra)
+    }
+
+    /// §4.5 命令 0x54 — 取消文件传输
+    private func handleFileCancel(seq: UInt8, payload: [UInt8]) {
+        guard let fileID = payload.first else {
+            sendReply(seq: seq, cmdID: CmdID.fileCancel.rawValue, result: ResultCode.invalidParam.rawValue)
+            return
+        }
+        guard let session = fileTransferSession, session.fileID == fileID else {
+            sendReply(seq: seq, cmdID: CmdID.fileCancel.rawValue, result: ResultCode.notFound.rawValue)
+            return
+        }
+        fileTransferSession = nil
+        sendReply(seq: seq, cmdID: CmdID.fileCancel.rawValue, result: ResultCode.success.rawValue)
+        sendEventFrame(eventID: EventID.fileCancel.rawValue, payload: [fileID, 0x00])
+    }
+
+    /// §3.5 AB03 文件数据块
+    private func handleFileDataChunk(_ data: Data) {
+        guard var session = fileTransferSession else {
+            log("AB03 无活跃传输会话，忽略 len=\(data.count)", direction: .received, level: .warn)
+            return
+        }
+        guard let bytes = KL252FrameCodec.validateAndStrip(data), bytes.count >= 3, bytes[0] == 0x00 else {
+            log("AB03 帧校验失败 \(hexString(data))", direction: .received, level: .warn)
+            return
+        }
+        let packetIndex = readUInt16LE(bytes, offset: 1)
+        let payload = Data(bytes[3...])
+        guard Int(packetIndex) < session.packetCount else {
+            log("AB03 忽略越界包 index=\(packetIndex) N=\(session.packetCount)", direction: .received)
+            return
+        }
+        let maxPayload = session.payloadMax
+        let isLast = Int(packetIndex) == session.packetCount - 1
+        let expectedSize: Int
+        if isLast {
+            let remainder = Int(session.fileSize) - (session.packetCount - 1) * maxPayload
+            expectedSize = max(1, min(maxPayload, remainder))
+        } else {
+            expectedSize = maxPayload
+        }
+        guard payload.count <= maxPayload, !isLast || payload.count == expectedSize else {
+            log("AB03 包 \(packetIndex) 长度异常 got=\(payload.count) expect≤\(expectedSize)", direction: .received, level: .warn)
+            return
+        }
+        if !isLast, payload.count != maxPayload {
+            log("AB03 包 \(packetIndex) 非末包长度不足 got=\(payload.count) expect=\(maxPayload)", direction: .received, level: .warn)
+            return
+        }
+        if session.received[packetIndex] == nil {
+            session.received[packetIndex] = payload
+            session.fileXor ^= KL252FrameCodec.xorChecksum([UInt8](payload))
+            fileTransferSession = session
+        }
+        log("AB03 收包 index=\(packetIndex) len=\(payload.count) 进度=\(session.received.count)/\(session.packetCount)", direction: .received)
+    }
+
     // MARK: - Reply Helpers
 
-    /// 发送命令应答帧 (RspType=0x00)
+    /// 发送命令应答帧 (RspType=0x00，§3.3)
     private func sendReply(seq: UInt8, cmdID: UInt8, result: UInt8, extra: [UInt8] = []) {
-        var frame: [UInt8] = [0x00, seq, cmdID, result]
-        frame += extra
+        var payload: [UInt8] = [0x00, seq, cmdID, result]
+        payload += extra
         log("rsp seq=\(seq) cmd=0x\(String(format: "%02X", cmdID)) result=0x\(String(format: "%02X", result)) extraLen=\(extra.count)", direction: .sent)
-        sendNotify(Data(frame))
+        sendNotify(KL252FrameCodec.wrap(payload))
     }
 
-    /// 发送名称修改应答（通过 0xAB02）
+    /// 发送名称修改应答（通过 0xAB02，§3.1）
     private func sendRenameReply(seq: UInt8, result: UInt8) {
-        let frame: [UInt8] = [0x00, seq, 0x55, result]
-        sendNotify(Data(frame))
+        let payload: [UInt8] = [0x00, seq, CmdID.rename.rawValue, result]
+        sendNotify(KL252FrameCodec.wrap(payload))
     }
 
-    /// 发送事件通知帧 (RspType=0x01)
+    /// 发送事件通知帧 (RspType=0x01，§3.4)
     func sendEventFrame(eventID: UInt8, payload: [UInt8]) {
-        var frame: [UInt8] = [0x01, 0xFF, eventID, UInt8(payload.count)]
-        frame += payload
+        var framePayload: [UInt8] = [0x01, 0xFF, eventID, UInt8(payload.count)]
+        framePayload += payload
         log("event id=0x\(String(format: "%02X", eventID)) payloadLen=\(payload.count)", direction: .sent)
-        sendNotify(Data(frame))
+        sendNotify(KL252FrameCodec.wrap(framePayload))
     }
 
     private func sendNotify(_ data: Data) {
@@ -1034,6 +1290,44 @@ final class KL252SimulatorCore: NSObject {
         cfg += [0x01, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
         cfg += [0x00, 0x64, 0x00, 0x00, 0x00, 0x50, 0x05]
         return cfg
+    }
+
+    private func readUInt32LE(_ bytes: [UInt8], offset: Int) -> UInt32 {
+        UInt32(bytes[offset]) | (UInt32(bytes[offset + 1]) << 8) |
+        (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24)
+    }
+
+    private func readUInt16LE(_ bytes: [UInt8], offset: Int) -> UInt16 {
+        UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+    }
+
+    /// §4.4 删除音源时，正在播放/暂停该 MusicID 则返回 busy
+    private func isMusicPlaybackBusy(for musicID: UInt32) -> Bool {
+        guard state.playSource == 0x00 else { return false }
+        guard state.playState == 0x01 || state.playState == 0x02 else { return false }
+        return state.currentMusicID == musicID
+    }
+
+    /// §5.2 当前 AB03 单包 payload 上限
+    private func currentFilePayloadMax() -> Int {
+        if lastEstimatedFilePayloadMax > 0 {
+            return lastEstimatedFilePayloadMax
+        }
+        return KL252SimMTU.protocolFilePayloadMax
+    }
+
+    /// §5.2 按 WindowBase 生成 128 位收包位图（bit0=LSB）
+    private func buildWindowBitmap(session: FileTransferSession, windowBase: UInt16) -> [UInt8] {
+        var bitmap = [UInt8](repeating: 0, count: 16)
+        for k in 0..<128 {
+            let packetIndex = Int(windowBase) + k
+            guard packetIndex < session.packetCount else { continue }
+            guard session.received[UInt16(packetIndex)] != nil else { continue }
+            let byteIndex = k / 8
+            let bitIndex = k % 8
+            bitmap[byteIndex] |= (1 << bitIndex)
+        }
+        return bitmap
     }
 
     // MARK: - Run State (供快捷面板修改)
@@ -1126,7 +1420,7 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
             } else if req.characteristic.uuid == KL252_DEVICE_UUID.deviceName {
                 handleRenameFrame(data)
             } else if req.characteristic.uuid == KL252_DEVICE_UUID.fileTransfer {
-                log("AB03 fileData len=\(data.count) (已忽略)", direction: .received)
+                handleFileDataChunk(data)
             } else {
                 log("write char=\(req.characteristic.uuid.uuidString) \(hexString(data))", direction: .received)
             }
