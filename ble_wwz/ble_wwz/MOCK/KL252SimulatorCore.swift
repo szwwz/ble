@@ -902,7 +902,7 @@ final class KL252SimulatorCore: NSObject {
     }
 
     private func handleSyncTime(seq: UInt8, payload: [UInt8]) {
-        guard payload.count == 7 else {
+        guard payload.count == 8 else {
             sendReply(seq: seq, cmdID: CmdID.syncTime.rawValue, result: ResultCode.invalidParam.rawValue)
             return
         }
