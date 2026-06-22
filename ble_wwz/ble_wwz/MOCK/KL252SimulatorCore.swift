@@ -353,17 +353,17 @@ private struct FileTransferSession {
     var fileSize: UInt32
     var packetCount: Int
     var payloadMax: Int
-    var received: [UInt16: Data] = [:]
-    var fileXor: UInt8 = 0
+    var received: Set<UInt16> = []
     /// 0x50 成功时预扣的存储空间（取消/失败/断连时释放）
     var storageReserved: UInt32
+    var staging: KL252SimulatorStorage.MusicStagingFile
 }
 
 private struct FirmwareUpgradeSession {
     var fileSize: UInt32
     var payloadMax: Int
-    var receivedData = Data()
     var phase: UpgradePhase = .handshaking
+    var staging: KL252SimulatorStorage.FirmwareStagingFile
 
     /// §5.0 活跃区间：自 UpCmd 0x81 起至 UpCmd 0x41 / 断连
     var isActive: Bool {
@@ -372,7 +372,7 @@ private struct FirmwareUpgradeSession {
 
     var progressPercent: UInt8 {
         guard fileSize > 0 else { return 0 }
-        let pct = receivedData.count * 100 / Int(fileSize)
+        let pct = staging.receivedBytes * 100 / Int(fileSize)
         return UInt8(min(100, pct))
     }
 }
@@ -422,11 +422,14 @@ final class KL252SimulatorCore: NSObject {
     // MARK: Init
     override init() {
         super.init()
+        KL252SimulatorStorage.ensureDirectories()
         peripheralManager = CBPeripheralManager(delegate: self, queue: .main)
+        WZLog("[KL252-SIM] 接收文件落盘目录: \(KL252SimulatorStorage.receivedRoot.path)", level: .info)
         if let snapshot = KL252SimulatorPersistence.load() {
             state.apply(snapshot)
         }
         reloadBundledMusicList()
+        refreshStorageAccounting()
         musicPlayer.delegate = self
     }
 
@@ -874,6 +877,7 @@ final class KL252SimulatorCore: NSObject {
             connectedCentrals.removeAll()
             centralSubscribedCharacteristics.removeAll()
             releaseFileTransferSession(reason: "Central 断开")
+            firmwareUpgradeSession?.staging.cancel()
             firmwareUpgradeSession = nil
             log("🔌 BLE 应用已全部断开", direction: .info)
             log(
@@ -1246,6 +1250,7 @@ final class KL252SimulatorCore: NSObject {
         state.currentMusicID = 0
         reloadBundledMusicList()
         releaseFileTransferSession(reason: "恢复出厂")
+        firmwareUpgradeSession?.staging.cancel()
         firmwareUpgradeSession = nil
         sendReply(seq: seq, cmdID: CmdID.factoryReset.rawValue, result: ResultCode.success.rawValue)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -1283,7 +1288,9 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         if let idx = state.musicList.firstIndex(of: mid) {
+            _ = KL252SimulatorStorage.deleteTransferredMusic(musicID: mid)
             state.musicList.remove(at: idx)
+            refreshStorageAccounting()
             sendReply(seq: seq, cmdID: CmdID.deleteMusic.rawValue, result: ResultCode.success.rawValue)
         } else {
             sendReply(seq: seq, cmdID: CmdID.deleteMusic.rawValue, result: ResultCode.notFound.rawValue)
@@ -1364,16 +1371,30 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         let payloadMax = currentFilePayloadMax()
-        let packetCount = Int((fileSize + UInt32(payloadMax) - 1) / UInt32(payloadMax))
+        let staging: KL252SimulatorStorage.MusicStagingFile
+        do {
+            staging = try KL252SimulatorStorage.MusicStagingFile.create(
+                fileID: fileID,
+                musicID: musicID,
+                fileSize: fileSize,
+                payloadMax: payloadMax
+            )
+        } catch {
+            log("0x50 创建落盘 staging 失败: \(error)", direction: .info, level: .warn)
+            sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.fileError.rawValue)
+            return
+        }
         state.storageFree -= fileSize
         fileTransferSession = FileTransferSession(
             fileID: fileID,
             musicID: musicID,
             fileSize: fileSize,
-            packetCount: packetCount,
+            packetCount: staging.packetCount,
             payloadMax: payloadMax,
-            storageReserved: fileSize
+            storageReserved: fileSize,
+            staging: staging
         )
+        log("0x50 开始传输 staging=\(staging.url.path) bytes=\(fileSize)", direction: .info)
         sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.success.rawValue)
     }
 
@@ -1389,21 +1410,33 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.notFound.rawValue)
             return
         }
-        guard session.received.count == session.packetCount, session.fileXor == expectedXor else {
-            releaseFileTransferSession(reason: "XOR 校验失败")
-            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.fileError.rawValue)
-            return
-        }
-        if !state.musicList.contains(session.musicID) {
-            state.musicList.append(session.musicID)
-            state.musicList.sort()
-        }
         let completedFileID = session.fileID
         let completedMusicID = session.musicID
-        fileTransferSession = nil
-        sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.success.rawValue)
-        sendEventFrame(eventID: EventID.fileComplete.rawValue,
-                       payload: [completedFileID] + withUnsafeBytes(of: completedMusicID.littleEndian) { Array($0) } + [0x00])
+        do {
+            let savedURL = try session.staging.finalize(
+                musicID: session.musicID,
+                expectedXor: expectedXor,
+                receivedPacketCount: session.received.count
+            )
+            fileTransferSession = nil
+            if !state.musicList.contains(session.musicID) {
+                state.musicList.append(session.musicID)
+                state.musicList.sort()
+            }
+            refreshStorageAccounting()
+            log("0x51 落盘成功 \(savedURL.path)", direction: .info)
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.success.rawValue)
+            sendEventFrame(eventID: EventID.fileComplete.rawValue,
+                           payload: [completedFileID] + withUnsafeBytes(of: completedMusicID.littleEndian) { Array($0) } + [0x00])
+        } catch KL252SimulatorStorage.StoreError.checksumMismatch {
+            releaseFileTransferSession(reason: "XOR 校验失败")
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.fileError.rawValue)
+            sendEventFrame(eventID: EventID.fileComplete.rawValue,
+                           payload: [completedFileID] + withUnsafeBytes(of: completedMusicID.littleEndian) { Array($0) } + [0x01])
+        } catch {
+            releaseFileTransferSession(reason: "落盘失败 \(error)")
+            sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.fileError.rawValue)
+        }
     }
 
     /// §4.5 命令 0x52 — 请求窗口状态（应答 CmdID 0x53）
@@ -1473,10 +1506,14 @@ final class KL252SimulatorCore: NSObject {
             log("AB03 包 \(packetIndex) 非末包长度不足 got=\(payload.count) expect=\(maxPayload)", direction: .received, level: .warn)
             return
         }
-        if session.received[packetIndex] == nil {
-            session.received[packetIndex] = payload
-            session.fileXor ^= KL252FrameCodec.xorChecksum([UInt8](payload))
-            fileTransferSession = session
+        if !session.received.contains(packetIndex) {
+            do {
+                try session.staging.write(packetIndex: packetIndex, payload: payload)
+                session.received.insert(packetIndex)
+                fileTransferSession = session
+            } catch {
+                log("AB03 写盘失败 index=\(packetIndex) \(error)", direction: .received, level: .warn)
+            }
         }
         log("AB03 收包 index=\(packetIndex) len=\(payload.count) 进度=\(session.received.count)/\(session.packetCount)", direction: .received)
     }
@@ -1547,6 +1584,7 @@ final class KL252SimulatorCore: NSObject {
     /// 合并 Bundle 预置音源与已传输音源 ID
     private func reloadBundledMusicList() {
         var ids = Set(KL252SimulatorMusicCatalog.bundledMusicIDs())
+        ids.formUnion(KL252SimulatorMusicCatalog.transferredMusicIDs())
         ids.formUnion(state.musicList)
         state.musicList = ids.sorted()
     }
@@ -1707,11 +1745,21 @@ final class KL252SimulatorCore: NSObject {
     /// 释放音源传输会话并归还预扣存储（§4.5 / §5.0）
     private func releaseFileTransferSession(reason: String) {
         guard let session = fileTransferSession else { return }
+        session.staging.cancel()
         if session.storageReserved > 0 {
             state.storageFree &+= session.storageReserved
         }
         fileTransferSession = nil
         log("文件传输会话已释放 reason=\(reason)", direction: .info)
+    }
+
+    private func refreshStorageAccounting() {
+        let used = KL252SimulatorStorage.totalPersistedBytes()
+        if used >= state.storageTotal {
+            state.storageFree = 0
+        } else {
+            state.storageFree = state.storageTotal - UInt32(used)
+        }
     }
 
     /// §4.6 AC01 升级控制帧
@@ -1766,14 +1814,25 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         let payloadMax = currentFilePayloadMax()
+        let staging: KL252SimulatorStorage.FirmwareStagingFile
+        do {
+            staging = try KL252SimulatorStorage.FirmwareStagingFile.create(
+                fileSize: fileSize,
+                payloadMax: payloadMax
+            )
+        } catch {
+            replyUpgradeHandshakeFail(fileSize: fileSize)
+            return
+        }
         firmwareUpgradeSession = FirmwareUpgradeSession(
             fileSize: fileSize,
             payloadMax: payloadMax,
-            phase: .transferring
+            phase: .transferring,
+            staging: staging
         )
         var sizeBytes = withUnsafeBytes(of: fileSize.littleEndian) { Array($0) }
         sendUpgradeNotify(KL252UpgradeFrameCodec.wrap(upCmd: UpCmd.handshakeOk.rawValue, data: sizeBytes))
-        log("AC02 UpCmd 0x81 握手成功 FileSize=\(fileSize) payloadMax=\(payloadMax)", direction: .sent)
+        log("AC02 UpCmd 0x81 握手成功 FileSize=\(fileSize) staging=\(staging.url.path)", direction: .sent)
     }
 
     private func replyUpgradeHandshakeFail(fileSize: UInt32) {
@@ -1790,7 +1849,7 @@ final class KL252SimulatorCore: NSObject {
             log("AC03 无活跃升级会话，拒绝数据 len=\(payload.count)", direction: .received, level: .warn)
             return
         }
-        let remaining = Int(session.fileSize) - session.receivedData.count
+        let remaining = Int(session.fileSize) - session.staging.receivedBytes
         guard remaining > 0, !payload.isEmpty, payload.count <= session.payloadMax, payload.count <= remaining else {
             sendUpgradeDataResponse(success: false)
             return
@@ -1799,14 +1858,19 @@ final class KL252SimulatorCore: NSObject {
             sendUpgradeDataResponse(success: false)
             return
         }
-        session.receivedData.append(contentsOf: payload)
-        session.phase = .transferring
-        firmwareUpgradeSession = session
-        sendUpgradeDataResponse(success: true)
-        log(
-            "AC03 收固件块 len=\(payload.count) 进度=\(session.receivedData.count)/\(session.fileSize)",
-            direction: .received
-        )
+        do {
+            try session.staging.append(Data(payload))
+            session.phase = .transferring
+            firmwareUpgradeSession = session
+            sendUpgradeDataResponse(success: true)
+            log(
+                "AC03 收固件块 len=\(payload.count) 进度=\(session.staging.receivedBytes)/\(session.fileSize)",
+                direction: .received
+            )
+        } catch {
+            sendUpgradeDataResponse(success: false)
+            log("AC03 写盘失败 \(error)", direction: .received, level: .warn)
+        }
     }
 
     private func sendUpgradeDataResponse(success: Bool) {
@@ -1827,10 +1891,20 @@ final class KL252SimulatorCore: NSObject {
         }
         session.phase = .flushing
         firmwareUpgradeSession = session
-        let ok = session.receivedData.count == Int(session.fileSize)
+        let versionBefore = "\(state.firmwareMajor).\(state.firmwareMinor).\(state.firmwarePatch)"
+        var ok = false
+        var savedPath = ""
+        do {
+            let savedURL = try session.staging.finalize(firmwareVersion: versionBefore)
+            ok = true
+            savedPath = savedURL.path
+        } catch {
+            session.staging.cancel()
+            ok = false
+        }
         sendUpgradeFinishResponse(success: ok)
         if ok {
-            applySimulatedFirmwareUpgrade()
+            applySimulatedFirmwareUpgrade(savedPath: savedPath)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.log("🔄 模拟设备重启完成（Bank 切换）", direction: .info)
             }
@@ -1864,7 +1938,7 @@ final class KL252SimulatorCore: NSObject {
         log("AC02 UpCmd 0x51 状态 phase=0x\(String(format: "%02X", phase.rawValue)) progress=\(progress)%", direction: .sent)
     }
 
-    private func applySimulatedFirmwareUpgrade() {
+    private func applySimulatedFirmwareUpgrade(savedPath: String) {
         if state.firmwarePatch < 255 {
             state.firmwarePatch &+= 1
         } else if state.firmwareMinor < 255 {
@@ -1872,8 +1946,9 @@ final class KL252SimulatorCore: NSObject {
             state.firmwarePatch = 0
         }
         state.buildNumber &+= 1
+        refreshStorageAccounting()
         log(
-            "固件升级落盘成功 → v\(state.firmwareMajor).\(state.firmwareMinor).\(state.firmwarePatch) build \(state.buildNumber)",
+            "固件升级落盘成功 → v\(state.firmwareMajor).\(state.firmwareMinor).\(state.firmwarePatch) build \(state.buildNumber) path=\(savedPath)",
             direction: .info
         )
     }
@@ -1893,7 +1968,7 @@ final class KL252SimulatorCore: NSObject {
         for k in 0..<128 {
             let packetIndex = Int(windowBase) + k
             guard packetIndex < session.packetCount else { continue }
-            guard session.received[UInt16(packetIndex)] != nil else { continue }
+            guard session.received.contains(UInt16(packetIndex)) else { continue }
             let byteIndex = k / 8
             let bitIndex = k % 8
             bitmap[byteIndex] |= (1 << bitIndex)

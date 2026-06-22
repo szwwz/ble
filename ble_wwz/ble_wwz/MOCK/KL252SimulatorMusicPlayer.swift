@@ -17,9 +17,15 @@ enum KL252SimulatorMusicCatalog {
         indexedTracks().keys.sorted()
     }
 
-    /// 根据 MusicID 查找音源文件 URL
+    /// BLE 传输落盘音源 ID（MOCK/received/music/）
+    static func transferredMusicIDs() -> [UInt32] {
+        KL252SimulatorStorage.transferredMusicIDs()
+    }
+
+    /// 根据 MusicID 查找音源文件 URL（Bundle sounds 优先，其次 BLE 传输落盘）
     static func url(for musicID: UInt32) -> URL? {
-        indexedTracks()[musicID]
+        if let bundled = indexedTracks()[musicID] { return bundled }
+        return KL252SimulatorStorage.musicURL(for: musicID)
     }
 
     /// 音源显示名（文件名 `_` 后部分，去扩展名）
