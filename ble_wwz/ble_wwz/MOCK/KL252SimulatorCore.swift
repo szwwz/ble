@@ -1,6 +1,6 @@
 // KL252SimulatorCore.swift
 // BLE 虚拟设备模拟器 - 核心外设管理器
-// 模拟 KL252 从机设备，响应协议 v1.0.1；含文件传输；不含固件升级 (§4.6)
+// 模拟 KL252 从机设备，响应协议 v1.0.1；含音源文件传输 (§4.5) 与双 BANK 固件升级 (§4.6)
 // ⚠️ 本文件为独立模拟器模块，不影响项目原有 BLE 业务代码
 
 import Foundation
@@ -46,6 +46,11 @@ enum KL252_DEVICE_UUID {
     static let command               = CBUUID(string: "AB01")  // Write
     static let response              = CBUUID(string: "AB02")  // Notify
     static let fileTransfer          = CBUUID(string: "AB03")  // Write Without Response
+    // 固件升级服务 §2.2 / §4.6
+    static let upgradeService        = CBUUID(string: "0000AC00-0000-1000-8000-00805F9B34FB")
+    static let upgradeControl        = CBUUID(string: "AC01")  // Write
+    static let upgradeResponse       = CBUUID(string: "AC02")  // Notify
+    static let upgradeData           = CBUUID(string: "AC03")  // Write Without Response
 }
 
 // MARK: - MTU（Peripheral 侧说明）
@@ -58,6 +63,60 @@ enum KL252_DEVICE_UUID {
 enum KL252SimMTU {
     static let protocolAttMtu: Int = 247
     static let protocolFilePayloadMax: Int = 238
+}
+
+// MARK: - Upgrade Frame Codec (§3.6)
+
+/// 固件升级帧：`A5 5A` + ControlWord `0x22` + FrameLen + UpCmd + Data + Checksum
+enum KL252UpgradeFrameCodec {
+    static let controlWord: UInt8 = 0x22
+
+    static func validateAndParse(_ data: Data) -> (upCmd: UInt8, data: [UInt8])? {
+        let raw = [UInt8](data)
+        guard raw.count >= 6,
+              raw[0] == KL252FrameCodec.header[0],
+              raw[1] == KL252FrameCodec.header[1],
+              raw[2] == controlWord else { return nil }
+        let frameLen = Int(raw[3])
+        guard frameLen >= 2, raw.count == 4 + frameLen else { return nil }
+        let checksumIndex = 3 + frameLen
+        let body = Array(raw[0..<checksumIndex])
+        guard KL252FrameCodec.xorChecksum(body) == raw[checksumIndex] else { return nil }
+        let upCmd = raw[4]
+        let payload = frameLen > 2 ? Array(raw[5..<checksumIndex]) : []
+        return (upCmd, payload)
+    }
+
+    static func wrap(upCmd: UInt8, data: [UInt8] = []) -> Data {
+        let frameLen = UInt8(data.count + 2)
+        var body: [UInt8] = KL252FrameCodec.header + [controlWord, frameLen, upCmd] + data
+        body.append(KL252FrameCodec.xorChecksum(body))
+        return Data(body)
+    }
+}
+
+/// 固件升级 UpCmd（GATT 0xAC00 命名空间，§4.6）
+private enum UpCmd: UInt8 {
+    case writeData      = 0x30
+    case dataOk         = 0x31
+    case dataFail       = 0x32
+    case finish         = 0x40
+    case finishReply    = 0x41
+    case queryState     = 0x50
+    case stateReply     = 0x51
+    case handshake      = 0x80
+    case handshakeOk    = 0x81
+    case handshakeFail  = 0x82
+}
+
+/// 升级阶段（UpCmd 0x51 UpgradeState，§4.6）
+private enum UpgradePhase: UInt8 {
+    case idle         = 0x00
+    case handshaking  = 0x01
+    case transferring = 0x02
+    case flushing     = 0x03
+    case success      = 0x04
+    case failed       = 0x05
 }
 
 // MARK: - 广播 Manufacturer Data
@@ -296,6 +355,26 @@ private struct FileTransferSession {
     var payloadMax: Int
     var received: [UInt16: Data] = [:]
     var fileXor: UInt8 = 0
+    /// 0x50 成功时预扣的存储空间（取消/失败/断连时释放）
+    var storageReserved: UInt32
+}
+
+private struct FirmwareUpgradeSession {
+    var fileSize: UInt32
+    var payloadMax: Int
+    var receivedData = Data()
+    var phase: UpgradePhase = .handshaking
+
+    /// §5.0 活跃区间：自 UpCmd 0x81 起至 UpCmd 0x41 / 断连
+    var isActive: Bool {
+        phase == .handshaking || phase == .transferring || phase == .flushing
+    }
+
+    var progressPercent: UInt8 {
+        guard fileSize > 0 else { return 0 }
+        let pct = receivedData.count * 100 / Int(fileSize)
+        return UInt8(min(100, pct))
+    }
 }
 
 // MARK: - Core Simulator
@@ -317,14 +396,15 @@ final class KL252SimulatorCore: NSObject {
     // MARK: Private - CoreBluetooth
     private var peripheralManager: CBPeripheralManager!
     private var responseChar: CBMutableCharacteristic?
+    private var upgradeResponseChar: CBMutableCharacteristic?
     private var batteryChar: CBMutableCharacteristic?
     private var deviceNameChar: CBMutableCharacteristic?
 
     /// 用户期望保持广播（开启后 true，手动停止后 false）
     private var wantsAdvertising = false
-    /// 已添加的 GATT 服务数量，三个全部就绪后再 startAdvertising
+    /// 已添加的 GATT 服务数量，全部就绪后再 startAdvertising
     private var addedServiceCount = 0
-    private let expectedServiceCount = 3
+    private let expectedServiceCount = 4
     /// Central 对各特征的订阅计数（同一 Central 会订阅 AB02 + 2A19）
     private var centralSubscriptions: [UUID: Int] = [:]
     /// 已建立 GATT 会话的 Central（订阅 / 读 / 写 任一即视为已连接）
@@ -334,6 +414,8 @@ final class KL252SimulatorCore: NSObject {
     private var resumeAdvertisingWorkItem: DispatchWorkItem?
     /// 进行中的音源文件传输会话（§5.0）
     private var fileTransferSession: FileTransferSession?
+    /// 进行中的固件升级会话（§4.6 / §5.0）
+    private var firmwareUpgradeSession: FirmwareUpgradeSession?
     /// §4.4 真实音源播放器
     private let musicPlayer = KL252SimulatorMusicPlayer()
 
@@ -408,6 +490,7 @@ final class KL252SimulatorCore: NSObject {
         lastEstimatedFilePayloadMax = 0
         responseChar = nil
         batteryChar = nil
+        upgradeResponseChar = nil
         deviceNameChar = nil
         log("🔴 已停止 BLE 广播", direction: .info)
         delegate?.simulatorDidUpdateState(self)
@@ -415,9 +498,13 @@ final class KL252SimulatorCore: NSObject {
 
     // MARK: - Proactive Events (快捷面板触发)
 
-    /// 主动上报电量
+    /// 主动上报电量（§7.1：传输/升级期间暂停）
     func notifyBatteryLevel(_ level: UInt8) {
         state.batteryLevel = level
+        if fileTransferSession != nil || isFirmwareUpgradeActive {
+            log("2A19 battery notify 跳过（传输/升级进行中）level=\(level)%", direction: .info)
+            return
+        }
         guard let battChar = batteryChar else { return }
         let data = Data([level])
         let ok = peripheralManager.updateValue(data, for: battChar, onSubscribedCentrals: nil)
@@ -596,10 +683,34 @@ final class KL252SimulatorCore: NSObject {
         let batteryService = CBMutableService(type: KL252_DEVICE_UUID.batteryService, primary: true)
         batteryService.characteristics = [batChar]
 
+        // --- 4. Firmware Upgrade Service (0xAC00) ---
+        let upCtrlChar = CBMutableCharacteristic(
+            type: KL252_DEVICE_UUID.upgradeControl,
+            properties: [.write],
+            value: nil,
+            permissions: [.writeable]
+        )
+        let upRspChar = CBMutableCharacteristic(
+            type: KL252_DEVICE_UUID.upgradeResponse,
+            properties: [.notify],
+            value: nil,
+            permissions: [.readable]
+        )
+        let upDataChar = CBMutableCharacteristic(
+            type: KL252_DEVICE_UUID.upgradeData,
+            properties: [.writeWithoutResponse],
+            value: nil,
+            permissions: [.writeable]
+        )
+        upgradeResponseChar = upRspChar
+        let upgradeService = CBMutableService(type: KL252_DEVICE_UUID.upgradeService, primary: true)
+        upgradeService.characteristics = [upCtrlChar, upRspChar, upDataChar]
+
         peripheralManager.add(genericAccessService)
         peripheralManager.add(customService)
+        peripheralManager.add(upgradeService)
         peripheralManager.add(batteryService)
-        log("正在注册 GATT 服务 (0x1800 / 0xAB00 / 0x180F)…", direction: .info)
+        log("正在注册 GATT 服务 (0x1800 / 0xAB00 / 0xAC00 / 0x180F)…", direction: .info)
     }
 
     private func beginAdvertising() {
@@ -637,6 +748,7 @@ final class KL252SimulatorCore: NSObject {
             CBAdvertisementDataLocalNameKey: state.deviceName,
             CBAdvertisementDataServiceUUIDsKey: [
                 KL252_DEVICE_UUID.customService,
+                KL252_DEVICE_UUID.upgradeService,
                 KL252_DEVICE_UUID.batteryService
             ],
             CBAdvertisementDataManufacturerDataKey: manufacturer
@@ -684,6 +796,9 @@ final class KL252SimulatorCore: NSObject {
         case KL252_DEVICE_UUID.command:       return "AB01(命令写入)"
         case KL252_DEVICE_UUID.response:      return "AB02(应答/事件 Notify)"
         case KL252_DEVICE_UUID.fileTransfer:  return "AB03(文件传输)"
+        case KL252_DEVICE_UUID.upgradeControl: return "AC01(升级控制)"
+        case KL252_DEVICE_UUID.upgradeResponse: return "AC02(升级应答)"
+        case KL252_DEVICE_UUID.upgradeData:    return "AC03(升级数据)"
         case KL252_DEVICE_UUID.deviceName:    return "2A00(设备名)"
         case KL252_DEVICE_UUID.batteryLevel:  return "2A19(电量)"
         default:                              return uuid.uuidString
@@ -711,7 +826,7 @@ final class KL252SimulatorCore: NSObject {
             direction: .info
         )
         log(
-            "   GATT 服务: 1800(Generic Access) / AB00(KL252 自定义) / 180F(Battery)",
+            "   GATT 服务: 1800(Generic Access) / AB00(KL252 自定义) / AC00(固件升级) / 180F(Battery)",
             direction: .info
         )
         if !peripheralManager.isAdvertising {
@@ -737,6 +852,9 @@ final class KL252SimulatorCore: NSObject {
         if characteristic.uuid == KL252_DEVICE_UUID.response {
             log("✅ central=\(shortID) 协议应答通道 AB02 已就绪，可收发命令/事件", direction: .info)
         }
+        if characteristic.uuid == KL252_DEVICE_UUID.upgradeResponse {
+            log("✅ central=\(shortID) 固件升级应答通道 AC02 已就绪", direction: .info)
+        }
         if subscribed.contains(KL252_DEVICE_UUID.response),
            subscribed.contains(KL252_DEVICE_UUID.batteryLevel) {
             log("✅ central=\(shortID) 全部 Notify 订阅完成 (AB02 + 2A19)，连接就绪", direction: .info)
@@ -755,7 +873,8 @@ final class KL252SimulatorCore: NSObject {
         if remaining == 0 {
             connectedCentrals.removeAll()
             centralSubscribedCharacteristics.removeAll()
-            fileTransferSession = nil
+            releaseFileTransferSession(reason: "Central 断开")
+            firmwareUpgradeSession = nil
             log("🔌 BLE 应用已全部断开", direction: .info)
             log(
                 wantsAdvertising ? "全部 Central 已断开，0.5s 后恢复广播" : "全部 Central 已断开，保持停播",
@@ -1126,7 +1245,8 @@ final class KL252SimulatorCore: NSObject {
         state.playSource = 0x00
         state.currentMusicID = 0
         reloadBundledMusicList()
-        fileTransferSession = nil
+        releaseFileTransferSession(reason: "恢复出厂")
+        firmwareUpgradeSession = nil
         sendReply(seq: seq, cmdID: CmdID.factoryReset.rawValue, result: ResultCode.success.rawValue)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.sendFactoryRestartEvent()
@@ -1228,7 +1348,7 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.invalidParam.rawValue)
             return
         }
-        if fileTransferSession != nil {
+        if fileTransferSession != nil || isFirmwareUpgradeActive {
             sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.busy.rawValue)
             return
         }
@@ -1245,12 +1365,14 @@ final class KL252SimulatorCore: NSObject {
         }
         let payloadMax = currentFilePayloadMax()
         let packetCount = Int((fileSize + UInt32(payloadMax) - 1) / UInt32(payloadMax))
+        state.storageFree -= fileSize
         fileTransferSession = FileTransferSession(
             fileID: fileID,
             musicID: musicID,
             fileSize: fileSize,
             packetCount: packetCount,
-            payloadMax: payloadMax
+            payloadMax: payloadMax,
+            storageReserved: fileSize
         )
         sendReply(seq: seq, cmdID: CmdID.fileStart.rawValue, result: ResultCode.success.rawValue)
     }
@@ -1268,7 +1390,7 @@ final class KL252SimulatorCore: NSObject {
             return
         }
         guard session.received.count == session.packetCount, session.fileXor == expectedXor else {
-            fileTransferSession = nil
+            releaseFileTransferSession(reason: "XOR 校验失败")
             sendReply(seq: seq, cmdID: CmdID.fileEnd.rawValue, result: ResultCode.fileError.rawValue)
             return
         }
@@ -1276,7 +1398,6 @@ final class KL252SimulatorCore: NSObject {
             state.musicList.append(session.musicID)
             state.musicList.sort()
         }
-        state.storageFree -= session.fileSize
         let completedFileID = session.fileID
         let completedMusicID = session.musicID
         fileTransferSession = nil
@@ -1314,7 +1435,7 @@ final class KL252SimulatorCore: NSObject {
             sendReply(seq: seq, cmdID: CmdID.fileCancel.rawValue, result: ResultCode.notFound.rawValue)
             return
         }
-        fileTransferSession = nil
+        releaseFileTransferSession(reason: "APP 取消")
         sendReply(seq: seq, cmdID: CmdID.fileCancel.rawValue, result: ResultCode.success.rawValue)
         sendEventFrame(eventID: EventID.fileCancel.rawValue, payload: [fileID, 0x00])
     }
@@ -1578,6 +1699,194 @@ final class KL252SimulatorCore: NSObject {
         return KL252SimMTU.protocolFilePayloadMax
     }
 
+
+    private var isFirmwareUpgradeActive: Bool {
+        firmwareUpgradeSession?.isActive ?? false
+    }
+
+    /// 释放音源传输会话并归还预扣存储（§4.5 / §5.0）
+    private func releaseFileTransferSession(reason: String) {
+        guard let session = fileTransferSession else { return }
+        if session.storageReserved > 0 {
+            state.storageFree &+= session.storageReserved
+        }
+        fileTransferSession = nil
+        log("文件传输会话已释放 reason=\(reason)", direction: .info)
+    }
+
+    /// §4.6 AC01 升级控制帧
+    private func handleUpgradeControlFrame(_ data: Data) {
+        guard let parsed = KL252UpgradeFrameCodec.validateAndParse(data) else {
+            log("AC01 帧校验失败 \(hexString(data))", direction: .received, level: .warn)
+            return
+        }
+        log("AC01 upCmd=0x\(String(format: "%02X", parsed.upCmd)) dataLen=\(parsed.data.count) frame=\(hexString(data))", direction: .received)
+        switch parsed.upCmd {
+        case UpCmd.handshake.rawValue:
+            handleUpgradeHandshake(payload: parsed.data)
+        case UpCmd.finish.rawValue:
+            handleUpgradeFinish(payload: parsed.data)
+        case UpCmd.queryState.rawValue:
+            handleUpgradeQueryState()
+        default:
+            log("AC01 未支持 UpCmd=0x\(String(format: "%02X", parsed.upCmd))", direction: .received, level: .warn)
+        }
+    }
+
+    /// §4.6 AC03 升级数据帧（UpCmd 0x30）
+    private func handleUpgradeDataFrame(_ data: Data) {
+        guard let parsed = KL252UpgradeFrameCodec.validateAndParse(data) else {
+            log("AC03 帧校验失败 \(hexString(data))", direction: .received, level: .warn)
+            return
+        }
+        guard parsed.upCmd == UpCmd.writeData.rawValue else {
+            log("AC03 忽略非 0x30 UpCmd=0x\(String(format: "%02X", parsed.upCmd))", direction: .received, level: .warn)
+            return
+        }
+        handleUpgradeWriteData(payload: parsed.data)
+    }
+
+    /// UpCmd 0x80 — 升级握手
+    private func handleUpgradeHandshake(payload: [UInt8]) {
+        guard payload.count >= 4 else {
+            replyUpgradeHandshakeFail(fileSize: 0)
+            return
+        }
+        let fileSize = readUInt32LE(payload, offset: 0)
+        if fileTransferSession != nil {
+            replyUpgradeHandshakeFail(fileSize: fileSize)
+            return
+        }
+        if isFirmwareUpgradeActive {
+            replyUpgradeHandshakeFail(fileSize: fileSize)
+            return
+        }
+        guard fileSize > 0 else {
+            replyUpgradeHandshakeFail(fileSize: fileSize)
+            return
+        }
+        let payloadMax = currentFilePayloadMax()
+        firmwareUpgradeSession = FirmwareUpgradeSession(
+            fileSize: fileSize,
+            payloadMax: payloadMax,
+            phase: .transferring
+        )
+        var sizeBytes = withUnsafeBytes(of: fileSize.littleEndian) { Array($0) }
+        sendUpgradeNotify(KL252UpgradeFrameCodec.wrap(upCmd: UpCmd.handshakeOk.rawValue, data: sizeBytes))
+        log("AC02 UpCmd 0x81 握手成功 FileSize=\(fileSize) payloadMax=\(payloadMax)", direction: .sent)
+    }
+
+    private func replyUpgradeHandshakeFail(fileSize: UInt32) {
+        var sizeBytes = withUnsafeBytes(of: fileSize.littleEndian) { Array($0) }
+        sendUpgradeNotify(KL252UpgradeFrameCodec.wrap(upCmd: UpCmd.handshakeFail.rawValue, data: sizeBytes))
+        firmwareUpgradeSession = nil
+        log("AC02 UpCmd 0x82 握手失败 FileSize=\(fileSize)", direction: .sent, level: .warn)
+    }
+
+    /// UpCmd 0x30 — 写固件数据（停等）
+    private func handleUpgradeWriteData(payload: [UInt8]) {
+        guard var session = firmwareUpgradeSession, session.isActive else {
+            sendUpgradeDataResponse(success: false)
+            log("AC03 无活跃升级会话，拒绝数据 len=\(payload.count)", direction: .received, level: .warn)
+            return
+        }
+        let remaining = Int(session.fileSize) - session.receivedData.count
+        guard remaining > 0, !payload.isEmpty, payload.count <= session.payloadMax, payload.count <= remaining else {
+            sendUpgradeDataResponse(success: false)
+            return
+        }
+        if remaining > session.payloadMax, payload.count != session.payloadMax {
+            sendUpgradeDataResponse(success: false)
+            return
+        }
+        session.receivedData.append(contentsOf: payload)
+        session.phase = .transferring
+        firmwareUpgradeSession = session
+        sendUpgradeDataResponse(success: true)
+        log(
+            "AC03 收固件块 len=\(payload.count) 进度=\(session.receivedData.count)/\(session.fileSize)",
+            direction: .received
+        )
+    }
+
+    private func sendUpgradeDataResponse(success: Bool) {
+        let status: UInt8 = success ? 0x01 : 0x00
+        let upCmd: UpCmd = success ? .dataOk : .dataFail
+        sendUpgradeNotify(KL252UpgradeFrameCodec.wrap(upCmd: upCmd.rawValue, data: [status]))
+    }
+
+    /// UpCmd 0x40 — 结束传输
+    private func handleUpgradeFinish(payload: [UInt8]) {
+        guard var session = firmwareUpgradeSession, session.isActive else {
+            sendUpgradeFinishResponse(success: false)
+            return
+        }
+        guard payload.first == 0x00 else {
+            sendUpgradeFinishResponse(success: false)
+            return
+        }
+        session.phase = .flushing
+        firmwareUpgradeSession = session
+        let ok = session.receivedData.count == Int(session.fileSize)
+        sendUpgradeFinishResponse(success: ok)
+        if ok {
+            applySimulatedFirmwareUpgrade()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.log("🔄 模拟设备重启完成（Bank 切换）", direction: .info)
+            }
+        }
+        firmwareUpgradeSession = nil
+    }
+
+    private func sendUpgradeFinishResponse(success: Bool) {
+        let status: UInt8 = success ? 0x01 : 0x00
+        sendUpgradeNotify(KL252UpgradeFrameCodec.wrap(upCmd: UpCmd.finishReply.rawValue, data: [status]))
+        log("AC02 UpCmd 0x41 结束应答 success=\(success)", direction: .sent)
+    }
+
+    /// UpCmd 0x50 — 查询升级状态
+    private func handleUpgradeQueryState() {
+        let phase: UpgradePhase
+        let progress: UInt8
+        if let session = firmwareUpgradeSession {
+            phase = session.phase
+            progress = session.progressPercent
+        } else {
+            phase = .idle
+            progress = 0
+        }
+        sendUpgradeNotify(
+            KL252UpgradeFrameCodec.wrap(
+                upCmd: UpCmd.stateReply.rawValue,
+                data: [phase.rawValue, progress]
+            )
+        )
+        log("AC02 UpCmd 0x51 状态 phase=0x\(String(format: "%02X", phase.rawValue)) progress=\(progress)%", direction: .sent)
+    }
+
+    private func applySimulatedFirmwareUpgrade() {
+        if state.firmwarePatch < 255 {
+            state.firmwarePatch &+= 1
+        } else if state.firmwareMinor < 255 {
+            state.firmwareMinor &+= 1
+            state.firmwarePatch = 0
+        }
+        state.buildNumber &+= 1
+        log(
+            "固件升级落盘成功 → v\(state.firmwareMajor).\(state.firmwareMinor).\(state.firmwarePatch) build \(state.buildNumber)",
+            direction: .info
+        )
+    }
+
+    private func sendUpgradeNotify(_ data: Data) {
+        guard let char = upgradeResponseChar else {
+            log("AC02 notify 失败 — 特征未就绪", direction: .info, level: .warn)
+            return
+        }
+        let ok = peripheralManager.updateValue(data, for: char, onSubscribedCentrals: nil)
+        log("AC02 notify \(hexString(data))\(ok ? "" : " [缓冲满]")", direction: .sent, level: ok ? .info : .warn)
+    }
+
     /// §5.2 按 WindowBase 生成 128 位收包位图（bit0=LSB）
     private func buildWindowBitmap(session: FileTransferSession, windowBase: UInt16) -> [UInt8] {
         var bitmap = [UInt8](repeating: 0, count: 16)
@@ -1702,6 +2011,10 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
                 handleRenameFrame(data)
             } else if req.characteristic.uuid == KL252_DEVICE_UUID.fileTransfer {
                 handleFileDataChunk(data)
+            } else if req.characteristic.uuid == KL252_DEVICE_UUID.upgradeControl {
+                handleUpgradeControlFrame(data)
+            } else if req.characteristic.uuid == KL252_DEVICE_UUID.upgradeData {
+                handleUpgradeDataFrame(data)
             } else {
                 log("write char=\(req.characteristic.uuid.uuidString) \(hexString(data))", direction: .received)
             }
