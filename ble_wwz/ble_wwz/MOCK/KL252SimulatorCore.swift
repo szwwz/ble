@@ -1,6 +1,6 @@
 // KL252SimulatorCore.swift
 // BLE 虚拟设备模拟器 - 核心外设管理器
-// 模拟 KL252 从机设备，响应协议 v1.0.1；含音源文件传输 (§4.5) 与双 BANK 固件升级 (§4.6)
+// 模拟 KL252 从机设备，响应协议 v1.0.2；含音源文件传输 (§4.5) 与双 BANK 固件升级 (§4.6)
 // ⚠️ 本文件为独立模拟器模块，不影响项目原有 BLE 业务代码
 
 import Foundation
@@ -42,6 +42,7 @@ enum KL252_DEVICE_UUID {
     // 标准特征
     static let deviceName            = CBUUID(string: "2A00")
     static let batteryLevel          = CBUUID(string: "2A19")
+    static let powerStatus           = CBUUID(string: "FF01")  // §7.1.2 电量 + 充电状态
     // 自定义特征
     static let command               = CBUUID(string: "AB01")  // Write
     static let response              = CBUUID(string: "AB02")  // Notify
@@ -152,7 +153,7 @@ enum KL252Advertisement {
 
 // MARK: - Frame Codec (§3.0)
 
-/// 全局帧头 `0xA5 0x5A` + 末字节 XOR 校验；2A19 电量与 CCCD 写入除外。
+/// 全局帧头 `0xA5 0x5A` + 末字节 XOR 校验；2A19 / FF01 电源状态与 CCCD 写入除外。
 enum KL252FrameCodec {
     static let header: [UInt8] = [0xA5, 0x5A]
 
@@ -257,6 +258,22 @@ struct SimAlarm {
     var wakeupPeriod: [UInt8]    // 7 bytes
 }
 
+// MARK: - Power Status (§7.1.2)
+
+enum KL252ChargeState: UInt8 {
+    case notCharging = 0x00
+    case charging    = 0x01
+    case fullyCharged = 0x02
+
+    var label: String {
+        switch self {
+        case .notCharging:  return "未充电"
+        case .charging:     return "充电中"
+        case .fullyCharged: return "已充满"
+        }
+    }
+}
+
 // MARK: - Simulator State
 
 class KL252SimulatorState {
@@ -269,8 +286,9 @@ class KL252SimulatorState {
     var firmwareMinor: UInt8 = 1
     var firmwarePatch: UInt8 = 3
     var buildNumber: UInt16 = 100
-    // 电量
+    // 电源状态 §7.1
     var batteryLevel: UInt8 = 85
+    var chargeState: UInt8 = KL252ChargeState.notCharging.rawValue
     // 时制 0=12h 1=24h
     var hourFormat: UInt8 = KL252SimulatorDefaults.hourFormat
     // 息屏配置 [Enable, OffH, OffM, OnH, OnM]
@@ -398,6 +416,7 @@ final class KL252SimulatorCore: NSObject {
     private var responseChar: CBMutableCharacteristic?
     private var upgradeResponseChar: CBMutableCharacteristic?
     private var batteryChar: CBMutableCharacteristic?
+    private var powerStatusChar: CBMutableCharacteristic?
     private var deviceNameChar: CBMutableCharacteristic?
 
     /// 用户期望保持广播（开启后 true，手动停止后 false）
@@ -405,7 +424,7 @@ final class KL252SimulatorCore: NSObject {
     /// 已添加的 GATT 服务数量，全部就绪后再 startAdvertising
     private var addedServiceCount = 0
     private let expectedServiceCount = 4
-    /// Central 对各特征的订阅计数（同一 Central 会订阅 AB02 + 2A19）
+    /// Central 对各特征的订阅计数（同一 Central 会订阅 AB02 + 2A19 + FF01）
     private var centralSubscriptions: [UUID: Int] = [:]
     /// 已建立 GATT 会话的 Central（订阅 / 读 / 写 任一即视为已连接）
     private var connectedCentrals: Set<UUID> = []
@@ -493,6 +512,7 @@ final class KL252SimulatorCore: NSObject {
         lastEstimatedFilePayloadMax = 0
         responseChar = nil
         batteryChar = nil
+        powerStatusChar = nil
         upgradeResponseChar = nil
         deviceNameChar = nil
         log("🔴 已停止 BLE 广播", direction: .info)
@@ -501,17 +521,61 @@ final class KL252SimulatorCore: NSObject {
 
     // MARK: - Proactive Events (快捷面板触发)
 
-    /// 主动上报电量（§7.1：传输/升级期间暂停）
+    /// 主动上报电量（§7.1.1：传输/升级期间暂停 2A19；同步推送 FF01）
     func notifyBatteryLevel(_ level: UInt8) {
         state.batteryLevel = level
-        if fileTransferSession != nil || isFirmwareUpgradeActive {
+        let paused = fileTransferSession != nil || isFirmwareUpgradeActive
+        if paused {
             log("2A19 battery notify 跳过（传输/升级进行中）level=\(level)%", direction: .info)
-            return
+        } else {
+            pushBatteryLevelNotify()
         }
+        if !paused {
+            pushPowerStatusNotify(reason: "电量变化")
+        }
+    }
+
+    /// 主动上报充电状态（§7.1.2：充电状态变化立即 Notify，不受传输/升级暂停限制）
+    func notifyChargeState(_ chargeState: UInt8) {
+        state.chargeState = chargeState
+        pushPowerStatusNotify(reason: "充电状态变化", immediate: true)
+        if fileTransferSession == nil, !isFirmwareUpgradeActive {
+            pushBatteryLevelNotify()
+        }
+    }
+
+    private func powerStatusPayload() -> Data {
+        Data([state.batteryLevel, state.chargeState])
+    }
+
+    private func chargeStateLabel(_ raw: UInt8) -> String {
+        KL252ChargeState(rawValue: raw)?.label ?? String(format: "0x%02X", raw)
+    }
+
+    private func pushBatteryLevelNotify() {
         guard let battChar = batteryChar else { return }
+        let level = state.batteryLevel
         let data = Data([level])
         let ok = peripheralManager.updateValue(data, for: battChar, onSubscribedCentrals: nil)
-        log("2A19 battery notify level=\(level)% \(hexString(data))\(ok ? "" : " [缓冲满]")", direction: .sent, level: ok ? .info : .warn)
+        log(
+            "2A19 battery notify level=\(level)% \(hexString(data))\(ok ? "" : " [缓冲满]")",
+            direction: .sent,
+            level: ok ? .info : .warn
+        )
+    }
+
+    private func pushPowerStatusNotify(reason: String, immediate: Bool = false) {
+        guard let char = powerStatusChar else { return }
+        let data = powerStatusPayload()
+        let ok = peripheralManager.updateValue(data, for: char, onSubscribedCentrals: nil)
+        let chargeLabel = chargeStateLabel(state.chargeState)
+        let note = immediate ? " [立即]" : ""
+        log(
+            "FF01 power status notify \(reason) level=\(state.batteryLevel)% \(chargeLabel) " +
+            "\(hexString(data))\(note)\(ok ? "" : " [缓冲满]")",
+            direction: .sent,
+            level: ok ? .info : .warn
+        )
     }
 
     /// 触发闹钟事件（E1 同步启动例程/闹钟音源并更新运行状态）
@@ -682,9 +746,16 @@ final class KL252SimulatorCore: NSObject {
             value: nil,
             permissions: [.readable]
         )
+        let powerChar = CBMutableCharacteristic(
+            type: KL252_DEVICE_UUID.powerStatus,
+            properties: [.read, .notify],
+            value: nil,
+            permissions: [.readable]
+        )
         batteryChar = batChar
+        powerStatusChar = powerChar
         let batteryService = CBMutableService(type: KL252_DEVICE_UUID.batteryService, primary: true)
-        batteryService.characteristics = [batChar]
+        batteryService.characteristics = [batChar, powerChar]
 
         // --- 4. Firmware Upgrade Service (0xAC00) ---
         let upCtrlChar = CBMutableCharacteristic(
@@ -804,6 +875,7 @@ final class KL252SimulatorCore: NSObject {
         case KL252_DEVICE_UUID.upgradeData:    return "AC03(升级数据)"
         case KL252_DEVICE_UUID.deviceName:    return "2A00(设备名)"
         case KL252_DEVICE_UUID.batteryLevel:  return "2A19(电量)"
+        case KL252_DEVICE_UUID.powerStatus:   return "FF01(电源状态)"
         default:                              return uuid.uuidString
         }
     }
@@ -822,6 +894,7 @@ final class KL252SimulatorCore: NSObject {
         log(
             "🔗 BLE 应用已连接 central=\(shortID) uuid=\(central.identifier.uuidString) " +
             "触发=\(trigger) 设备=\(state.deviceName) 电量=\(state.batteryLevel)% " +
+            "充电=\(chargeStateLabel(state.chargeState)) " +
             "notifyMax=\(lastCentralNotifyMaxLength)B estATT_MTU=\(lastEstimatedAttMtu) " +
             "estWriteMax=\(lastEstimatedAttMtu - 3)B estFilePayloadMax=\(lastEstimatedFilePayloadMax)B " +
             "[\(mtuStatusNote(attMtu: lastEstimatedAttMtu))] " +
@@ -858,10 +931,15 @@ final class KL252SimulatorCore: NSObject {
         if characteristic.uuid == KL252_DEVICE_UUID.upgradeResponse {
             log("✅ central=\(shortID) 固件升级应答通道 AC02 已就绪", direction: .info)
         }
-        if subscribed.contains(KL252_DEVICE_UUID.response),
-           subscribed.contains(KL252_DEVICE_UUID.batteryLevel) {
-            log("✅ central=\(shortID) 全部 Notify 订阅完成 (AB02 + 2A19)，连接就绪", direction: .info)
+        if isNotifySubscriptionReady(subscribed) {
+            log("✅ central=\(shortID) 全部 Notify 订阅完成 (AB02 + 2A19 + FF01)，连接就绪", direction: .info)
         }
+    }
+
+    private func isNotifySubscriptionReady(_ subscribed: Set<CBUUID>) -> Bool {
+        subscribed.contains(KL252_DEVICE_UUID.response)
+            && subscribed.contains(KL252_DEVICE_UUID.batteryLevel)
+            && subscribed.contains(KL252_DEVICE_UUID.powerStatus)
     }
 
     private func logCentralDisconnected(_ central: CBCentral, via characteristic: CBCharacteristic) {
@@ -905,9 +983,8 @@ final class KL252SimulatorCore: NSObject {
             if characteristic.uuid == KL252_DEVICE_UUID.response {
                 log("✅ central=\(centralShortID(central)) 协议应答通道 AB02 已就绪，可收发命令/事件", direction: .info)
             }
-            if subscribed.contains(KL252_DEVICE_UUID.response),
-               subscribed.contains(KL252_DEVICE_UUID.batteryLevel) {
-                log("✅ central=\(centralShortID(central)) 全部 Notify 订阅完成 (AB02 + 2A19)，连接就绪", direction: .info)
+            if isNotifySubscriptionReady(subscribed) {
+                log("✅ central=\(centralShortID(central)) 全部 Notify 订阅完成 (AB02 + 2A19 + FF01)，连接就绪", direction: .info)
             }
         }
         syncAdvertisingState(reason: "Central 订阅")
@@ -2104,6 +2181,14 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
             request.value = Data([state.batteryLevel])
             peripheral.respond(to: request, withResult: .success)
             log("read 2A19 battery → \(state.batteryLevel)%", direction: .received)
+        } else if request.characteristic.uuid == KL252_DEVICE_UUID.powerStatus {
+            request.value = powerStatusPayload()
+            peripheral.respond(to: request, withResult: .success)
+            log(
+                "read FF01 power status → \(state.batteryLevel)% \(chargeStateLabel(state.chargeState)) " +
+                "\(hexString(powerStatusPayload()))",
+                direction: .received
+            )
         } else if request.characteristic.uuid == KL252_DEVICE_UUID.deviceName {
             request.value = state.deviceName.data(using: .utf8)
             peripheral.respond(to: request, withResult: .success)
@@ -2118,10 +2203,15 @@ extension KL252SimulatorCore: CBPeripheralManagerDelegate {
                            central: CBCentral,
                            didSubscribeTo characteristic: CBCharacteristic) {
         addCentralSubscription(central, characteristic: characteristic)
-        // 订阅电量特征后立即推送当前电量
+        // 订阅电源特征后立即推送当前状态（§7.1）
         if characteristic.uuid == KL252_DEVICE_UUID.batteryLevel {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.notifyBatteryLevel(self?.state.batteryLevel ?? 85)
+                self?.pushBatteryLevelNotify()
+            }
+        }
+        if characteristic.uuid == KL252_DEVICE_UUID.powerStatus {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.pushPowerStatusNotify(reason: "订阅后初始推送")
             }
         }
     }

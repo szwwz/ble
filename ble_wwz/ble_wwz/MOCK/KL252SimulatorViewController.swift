@@ -15,6 +15,7 @@ final class KL252SimulatorViewModel: ObservableObject, KL252SimulatorDelegate {
     @Published private(set) var isAdvertising = false
     @Published private(set) var deviceName = "KL252-SIM"
     @Published private(set) var batteryLevel: UInt8 = 85
+    @Published private(set) var chargeStateText = "未充电"
     @Published private(set) var playStateText = "空闲"
     @Published private(set) var currentMusicText = "—"
     @Published private(set) var musicTrackCount = 0
@@ -63,6 +64,12 @@ final class KL252SimulatorViewModel: ObservableObject, KL252SimulatorDelegate {
 
     func sendBattery85() { simulator.notifyBatteryLevel(85) }
     func sendBattery20() { simulator.notifyBatteryLevel(20) }
+    func sendCharging() { simulator.notifyChargeState(KL252ChargeState.charging.rawValue) }
+    func sendFullyCharged() {
+        simulator.state.batteryLevel = 100
+        simulator.notifyChargeState(KL252ChargeState.fullyCharged.rawValue)
+    }
+    func sendNotCharging() { simulator.notifyChargeState(KL252ChargeState.notCharging.rawValue) }
     func sendFactoryEvent() { simulator.sendFactoryRestartEvent() }
 
     // MARK: - 快捷面板：机身音乐按键 (§4.4 真实播放)
@@ -105,6 +112,7 @@ final class KL252SimulatorViewModel: ObservableObject, KL252SimulatorDelegate {
         isAdvertising = simulator.isAdvertising
         deviceName = simulator.state.deviceName
         batteryLevel = simulator.state.batteryLevel
+        chargeStateText = KL252ChargeState(rawValue: simulator.state.chargeState)?.label ?? "—"
         musicTrackCount = simulator.state.musicList.count
         playStateText = Self.playStateLabel(
             state: simulator.state.playState,
@@ -174,9 +182,12 @@ struct KL252SimulatorView: View {
                 ("传输完成 E5", { $0.sendFileComplete() }),
                 ("传输取消 E6", { $0.sendFileCancel() }),
             ]),
-            SimulatorQuickSection(title: "🔋 电量 / 系统", actions: [
+            SimulatorQuickSection(title: "🔋 电源状态 / 系统", actions: [
                 ("上报电量 85%", { $0.sendBattery85() }),
                 ("上报电量 20%", { $0.sendBattery20() }),
+                ("充电中 FF01", { $0.sendCharging() }),
+                ("已充满 FF01", { $0.sendFullyCharged() }),
+                ("未充电 FF01", { $0.sendNotCharging() }),
                 ("恢复出厂 E8", { $0.sendFactoryEvent() }),
             ]),
         ]
@@ -211,7 +222,7 @@ struct KL252SimulatorView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(viewModel.isAdvertising ? .red : .green)
             }
-            Text("设备名: \(viewModel.deviceName)  |  电量: \(viewModel.batteryLevel)%")
+            Text("设备名: \(viewModel.deviceName)  |  电量: \(viewModel.batteryLevel)%  |  充电: \(viewModel.chargeStateText)")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
