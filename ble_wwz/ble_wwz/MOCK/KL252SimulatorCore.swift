@@ -61,8 +61,8 @@ enum KL252_DEVICE_UUID {
 //
 // KL252 协议参考：ATT_MTU = 247 → AB03 文件块 payloadMax = 238（= MTU - 9，§3.5）。
 enum KL252SimMTU {
-    static let protocolAttMtu: Int = 247
-    static let protocolFilePayloadMax: Int = 238
+    static let protocolAttMtu: Int = 23
+    static let protocolFilePayloadMax: Int = 14
 }
 
 // MARK: - Upgrade Frame Codec (§3.6)
@@ -1731,9 +1731,9 @@ final class KL252SimulatorCore: NSObject {
 
     /// §5.2 当前 AB03 单包 payload 上限
     private func currentFilePayloadMax() -> Int {
-        if lastEstimatedFilePayloadMax > 0 {
-            return lastEstimatedFilePayloadMax
-        }
+//        if lastEstimatedFilePayloadMax > 0 {
+//            return lastEstimatedFilePayloadMax
+//        }
         return KL252SimMTU.protocolFilePayloadMax
     }
 
